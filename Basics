@@ -1,0 +1,271 @@
+Here’s a crisp, beginner-friendly q primer you can actually use at the console right away.
+
+What q is (and why it’s used)
+
+q is a terse, array-first language bundled with the kdb+ in-memory/time-series database.
+
+It’s designed for fast analytics on big, columnar tables (especially time-stamped market data).
+
+Think: the speed of NumPy, the convenience of SQL, packed into one REPL.
+
+
+Mental model (in one minute)
+
+Everything is a vector. Scalars are just length-1 vectors.
+
+You transform whole columns at once—few loops, lots of vector ops.
+
+Tables are columnar lists; queries are either:
+
+qSQL (SQL-ish syntax), or
+
+functional (composing verbs like +, /, ').
+
+
+
+Core building blocks
+
+Atoms, lists, dictionaries, tables
+
+/ atoms
+42         / int
+3.14       / float
+`IBM       / symbol (interned string)
+2025.09.15 / date
+
+/ lists (homogeneous)
+1 2 3
+`IBM`MSFT`AAPL
+10:00 10:01 10:02  / times
+
+/ dictionary (map keys->values)
+d:`IBM`MSFT!101.2 305.5
+
+/ table (dict of equal-length columns)
+t:([] sym:`IBM`MSFT; px:101.2 305.5; qty:100 50)
+
+/ keyed table (index-like)
+kt:([sym:`IBM`MSFT] px:101.2 305.5; qty:100 50)
+
+Types you’ll meet a lot
+
+symbol `AAPL (fast for categorical keys)
+
+timestamp/time/date 2025.09.15D10:00:00.000000000
+
+numeric (byte/short/int/long/real/float); nulls are type-specific (e.g., 0N, 0Nf).
+
+
+Vectors > loops (verbs & adverbs)
+
+Verbs (functions) are vector-wise
+
+1 2 3 + 10         / 11 12 13   (broadcast)
+(1 2 3) * 2 3 4    / 2 6 12     (elementwise)
+
+Adverbs (modify how a verb applies)
+
+Each ' : apply per element
+
+Over / : fold/reduce
+
+Scan \ : running fold
+
+
+sqrt' 1 4 9        / each
++/ 1 2 3           / over => 6 (sum)
++\ 1 2 3           / scan => 1 3 6 (running sum)
+
+qSQL: selecting, grouping, updating
+
+Given:
+
+t:([] time:10:00 10:00 10:01 10:01; sym:`IBM`IBM`MSFT`MSFT; px:101 102 305 306; qty:50 25 10 20)
+
+Filter & project
+
+select time,sym,px from t where sym=`IBM, px>101
+
+Aggregation & group by
+
+select avg px by sym from t
+select sum qty by sym,time from t
+
+Update / Delete
+
+update notional:px*qty from t
+delete from t where qty<20
+
+Joins you’ll actually use
+
+Equi-join: lj (left), ij (inner), uj (union)
+
+As-of join (time-series): aj (last match on a sorted key), aj0 (exact-or-previous)
+
+
+/ prices by minute, trades by tick: get last price as of trade time
+aj[`time; trades; prices]
+
+Functional form of queries (power move)
+
+Everything you can write in qSQL is a function call too:
+
+/ qSQL
+select sum qty by sym from t
+
+/ functional (same)
+select[; enlist `sym]!((, `sum) , enlist `qty) t
+
+(You won’t start here, but it helps when you build dynamic queries.)
+
+Common table operations (by example)
+
+Sort, take, where
+
+asc t by px                 / sort by px
+t where sym in `IBM`MSFT    / boolean filter
+t 0 2                       / take rows 0 and 2
+
+Keying (indexing)
+
+kt: t xkey `sym             / make sym the key
+kt[`IBM]                    / row(s) for IBM fast
+
+Pivot (cross-tab)
+
+/ avg price by (sym x time)
+update minute:0D00:01 xbar time from t
+select avg px by sym, minute from t
+
+Time-series essentials
+
+Keep time columns sorted for aj.
+
+Use keyed tables on (sym,time) (or partitioned on date) for speed.
+
+Rolling windows:
+
+
+/ 3-point moving avg price within each sym (by sym, apply scan)
+update mavg:3 mavg px by sym from t
+
+Processes & IPC (very quick tour)
+
+q runs a process with tables in memory.
+
+You can subscribe to ticks (tickerplant), or call remote processes:
+
+
+h:hopen `:localhost:5000
+h "select avg px by sym from trade"
+
+Performance habits
+
+Prefer symbols for keys and categories.
+
+Keep columns typed (avoid generic lists).
+
+Vectorize: avoid explicit loops; use ', /, \.
+
+Sort once, then use aj for time-aligned lookups.
+
+Use keyed tables for random access; splayed/partitioned on disk for big data.
+
+
+Debugging & safety nets
+
+\ts expr        / time & space of expr
+\l file.q       / load script
+show t          / pretty print
+type x          / type info;  -8h int; -11h symbol; -14h date; -12h timestamp
+raze, enlist    / flatten vs wrap; handy when shapes don’t match
+
+Quick “q vs SQL vs pandas” mapping
+
+SELECT … WHERE → select … from t where …
+
+GROUP BY → select agg col by key from t
+
+JOIN ON → lj/ij/uj (equi), aj (as-of)
+
+DataFrame → table; Series → column (vector)
+
+apply/map → each ', reductions +/, max/
+
+
+12 tiny exercises (paste into q)
+
+/ 1) Build a table
+t:([] sym:10?`IBM`MSFT`AAPL; px:10?100f; qty:10?100)
+
+/ 2) Add notional
+update notional:px*qty from t
+
+/ 3) Top 3 by notional
+t desc notional
+t til 3
+
+/ 4) Average px by sym
+select avg px by sym from t
+
+/ 5) Filter two syms
+t where sym in `IBM`AAPL
+
+/ 6) Running sum of qty by sym
+update rq:+\qty by sym from t
+
+/ 7) Left join small ref table
+ref:([] sym:`IBM`MSFT`AAPL; sector:`tech`tech`tech)
+lj[`sym; t; ref]
+
+/ 8) Create minute column & group
+update minute:0D00:01 xbar 09:30:00 + (10?3600) from t
+select sum qty by sym,minute from t
+
+/ 9) As-of join (build px by minute; trades by seconds)
+px:([] time:09:30+0D00:01*til 5; sym:`IBM`MSFT`AAPL 5#; px:100+til 5)
+tr:([] time:09:30+0D00:00:15*til 8; sym:8?`IBM`MSFT`AAPL; qty:8?50)
+aj[`time; tr; px]
+
+/ 10) Each: square a list
+({x*x}' 1 2 3)
+
+/ 11) Over: cumulative max
+max\ 3 1 4 1 5
+
+/ 12) Scan: running average
+(+\ x)%1+til count x:1 2 3 4
+
+Mini cheat sheet (keep handy)
+
+Syntax & ops
+
+Comments: / ...
+
+Assign: x:expr
+
+Lambda: {x+y}; with args {[a;b] a+b}
+
+Apply: f'[list] each, +/ list reduce, +\ list scan
+
+Compose: f g (compose), f@x (apply), g f/x (fold with g then f)
+
+
+Joins
+
+lj left, ij inner, uj union, aj as-of, wj windowed join
+
+
+Nulls
+
+0N (int null), 0Nf (float), ` (symbol null), 0Np (timestamp)
+
+
+I/O
+
+Save: save :file(binary),hdb` uses splayed/partitioned dirs
+
+CSV: ("SFF"; enlist ",") 0: :f.csv; / write
+
+Read CSV: ("SSFF"; enlist ",") 0: :f.csv
+
