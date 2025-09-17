@@ -1,0 +1,85 @@
+Got it — you want to filter out rows from a q table based on pairs of values across two columns.
+In q/kdb+, you do this with where conditions, possibly using except or by constructing a list of disallowed pairs.
+
+
+---
+
+Example setup
+
+q)t:([] sym:`A`B`C`A`B; id:1 2 3 1 3; val:10 20 30 40 50)
+q)t
+sym id val
+-----------
+A   1  10
+B   2  20
+C   3  30
+A   1  40
+B   3  50
+
+Suppose you want to remove rows where (sym,id) is (A,1) or (B,3).
+
+
+---
+
+1. Using except with a subtable
+
+q)bad:flip `sym`id!(`A`B;1 3)
+q)update keep:flip `sym`id from t
+'type
+
+But that fails because flip is not the right way. Instead:
+
+q)bad:([] sym:`A`B; id:1 3)
+q)t except bad
+sym id val
+-----------
+B   2  20
+C   3  30
+
+Here except drops any rows whose (sym,id) pair matches those in bad.
+
+
+---
+
+2. Using where with not in
+
+q)badPairs:([] sym:`A`B; id:1 3)
+q)t where not enlist each (t[`sym],t[`id]) in enlist each (badPairs[`sym],badPairs[`id])
+
+This works but is less idiomatic.
+
+
+---
+
+3. Most idiomatic: join & filter
+
+q)t lj `sym`id xkey ([] sym:`A`B; id:1 3)
+q)t lj `sym`id xkey bad
+
+Then filter rows where the join fails.
+
+
+---
+
+Best practice
+
+If you already have the pairs to exclude as a table:
+
+q)bad:([] sym:`A`B; id:1 3)
+q)raze raze
+q)t except bad
+
+
+---
+
+✅ Answer in short:
+Use except with a table of the disallowed (col1,col2) pairs:
+
+q)bad:([] sym:`A`B; id:1 3)
+q)t except bad
+
+
+---
+
+Do you want the disallowed pairs to be hard-coded (like (A,1) and (B,3)), or do you want q to automatically detect pairs that appear in both columns and remove them?
+
