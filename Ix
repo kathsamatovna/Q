@@ -1,0 +1,390 @@
+Great — let’s pin this to FX NDFs specifically. Below I’ll take each analysis angle and translate it into the NDF world: what to measure, how to compute it, and exactly what to plot. I’ll keep the math simple and concrete.
+
+Quick NDF reminders we’ll lean on:
+
+Quotes are typically outright or points for a tenor (e.g., 1M USD/INR NDF).
+
+PnL drivers: mark-out vs fixing, carry (IR differential / points decay), curve/basis moves, proxy-hedge slippage, and liquidity/time-of-day.
+
+Key timestamps: trade time, local-market hours, fixing time/date, NY cut/Ldn cut, internalisation time.
+
+
+
+---
+
+1) Timing analysis (relative to fixing & liquidity windows)
+
+What you’re testing Does internalising a voice ticket flatten eRisk’s position right before a favorable period (e.g., into fixing), destroying mark-out alpha or carry?
+
+Metrics
+
+Missed fixing PnL if eRisk had kept the position to the fixing:
+
+
+\Delta \text{PnL}_{\text{fix}} = \text{Notional} \times \left(F_{\text{fix}} - P_{\text{int}}\right) \times \text{USD per unit}
+
+: official fixing rate used for the NDF cash settlement
+
+Missed horizon PnL (intraday/overnight, not to fixing):
+
+
+\Delta \text{PnL}_{T} = \text{Notional} \times \left(M_{T} - P_{\text{int}}\right)
+
+Time-to-fix (TTF) at internalisation: hours remaining to fixing (or to NY/Ldn close).
+
+Market state: local market open/closed flag at internalisation. (NDFs often move most in local hours.)
+
+
+How to check For every internalised voice ticket that offsets eRisk:
+
+1. Record , TTF, local-hour flag.
+
+
+2. Take realised  and intraday mids .
+
+
+3. Compute  and .
+
+
+
+Plots
+
+Scatter:  (y) vs TTF (x).
+Interpretation: big positives at small TTF ⇒ you’re killing fixing alpha late in the day.
+
+Boxplots of  split by local-hours vs off-hours.
+
+Intraday heatmap: average  by hour-of-day × currency.
+
+
+
+---
+
+2) Size & concentration (inventory impact by tenor)
+
+What you’re testing Do large voice internalisations wipe out eRisk inventory disproportionately (and in which tenors)?
+
+Metrics
+
+Impact ratio by tenor:
+
+
+\text{Impact}(\tau)=\frac{\min\{\text{voice size at }\tau,\ \text{eRisk inv. at }\tau\}}{\text{eRisk inv. at }\tau}
+
+Tenor concentration: Herfindahl index across tenors before vs after internalisations.
+
+
+How to check At time of each internalisation:
+
+Bucket by tenor (1W, 1M, 3M, …).
+
+Compute Impact(τ) and aggregate daily/weekly.
+
+
+Plots
+
+Histogram of Impact(τ) for each tenor.
+
+Stacked time series: eRisk inventory by tenor vs overlay of inventory removed (shaded).
+
+Before/after bars: tenor Herfindahl index (is inventory becoming “flatter” than desired?).
+
+
+
+---
+
+3) Market context: points, basis & realised volatility
+
+What you’re testing Does internalisation remove positions that benefit from points decay/carry, basis moves, or realised spot volatility into fixing?
+
+Metrics
+
+Carry/points PnL foregone up to fixing:
+
+
+\Delta \text{Carry} = \text{Notional} \times \left( \text{Points}_{t} - \text{Points}_{t+\text{TTF}} \right)
+
+Basis move PnL foregone: change in USD–local basis component impacting NDF quotes between internalisation and horizon/fixing.
+
+Realised spot vol into fixing (σ_real over TTF window), proxying the chance of favorable mark-out.
+
+
+How to check
+
+Decompose forward points into clean IR carry + basis; reprice the position at fixing/horizon.
+
+Compute realised vol on the spot proxy (or non-deliverable reference) over the TTF window.
+
+
+Plots
+
+Scatter: basis move (x) vs  (y).
+
+Boxplot:  by realised vol quintile (over TTF).
+
+Lines: average points decay vs time-to-fix alongside average missed PnL.
+
+
+
+---
+
+4) Client/flow intent (by segment & direction)
+
+What you’re testing Do certain voice client types (corp, real money, macro HF) or directions (buy/sell USD) systematically cancel eRisk’s profitable skew?
+
+Metrics
+
+Avg missed fixing PnL by client segment & direction.
+
+Hit rate: % of internalisations with  (i.e., harmful) by segment.
+
+Flow-sign correlation: corr(sign of voice flow, eRisk position sign) over rolling windows.
+
+
+How to check
+
+Tag each internalised trade with segment and direction.
+
+Compute segment-level stats weekly/monthly.
+
+
+Plots
+
+Bar chart: avg  by segment × direction.
+
+Time series: rolling correlation between voice sign and eRisk position sign (per currency).
+
+
+
+---
+
+5) Pricing / execution quality (saved cost vs lost alpha)
+
+What you’re testing Is the spread/impact you save by internalising smaller than the alpha you lose (to fixing or near-term horizon)?
+
+Metrics
+
+Saved external cost:
+
+
+\text{Saved} = \text{Notional} \times \text{(best external half-spread)} \quad (\text{or impact model})
+
+Net value add = Saved − Lost.
+
+
+How to check
+
+Snapshot best external quotes (or your cost model) at internalisation time.
+
+Compare per-trade then aggregate.
+
+
+Plots
+
+Scatter: Saved (x) vs Lost (y).
+Quadrants reveal when the policy helps/hurts.
+
+Cumulative line: time series of Σ(Net value add).
+
+
+
+---
+
+6) Strategic alignment: skew preservation rules
+
+What you’re testing Is the engine always flattening eRisk’s desired skew, or does it preserve core exposure where alpha lives (e.g., keep x% of net long USD/INR into fixing)?
+
+Metrics
+
+Skew preserved (% of pre-trade eRisk position still held after internalisation).
+
+Outcome by rule: if you had kept a floor (e.g., min 30% inventory), what would  have been?
+
+
+How to check
+
+Re-run the tape with counterfactual rules:
+
+“Do not internalise beyond X% of current eRisk inventory.”
+
+“If TTF < Y hours, cap internalisation at Z%.”
+
+“If realised vol (prev 1h) > threshold, preserve skew.”
+
+
+
+Plots
+
+Bars: avg missed PnL vs skew-preservation level (0%, 20%, 40%…).
+
+Frontier: (Bank PnL, PnL vol) under different skew floors.
+
+
+
+---
+
+7) Scenario / back-test (policies for NDFs)
+
+What you’re testing Which internalisation policy maximises bank-wide PnL after costs, for NDFs?
+
+Policies to simulate
+
+1. Full internalise everything feasible.
+
+
+2. No internalise (desk-level hedge).
+
+
+3. Selective: (a) cap by impact ratio, (b) TTF-aware, (c) vol/basis-aware, (d) segment-aware.
+
+
+
+Metrics
+
+Total PnL and PnL volatility by currency & tenor.
+
+Tail risk (e.g., 95/99% daily VaR).
+
+Implementation drag (missed fills, slippage in the counterfactual).
+
+
+Plots
+
+Cumulative PnL lines per policy.
+
+Risk–return scatter: mean daily PnL (x) vs daily PnL stdev (y) per policy.
+
+By-currency bars: net value add of selective vs full internalise.
+
+
+
+---
+
+8) Curve & carry attribution (NDF-specific greeks)
+
+What you’re testing How much of the “good risk” eRisk wants is carry vs curve vs basis — and is voice internalisation removing the “good” buckets?
+
+Metrics
+
+Carry theta per tenor (daily expected points decay into fixing).
+
+Curve DV01-like per tenor: PnL per 1bp move in USD–local IR differential.
+
+Basis beta: PnL per unit move in your basis proxy.
+
+
+How to check
+
+Build a simple attribution for each eRisk position at internalisation:
+
+
+\Delta \text{PnL} \approx \Theta_{\text{carry}}\cdot \Delta t + \text{DV01}_{\text{curve}}\cdot \Delta \text{curve} + \beta_{\text{basis}}\cdot \Delta \text{basis} + \text{mark-out}
+
+Plots
+
+Stacked bars: average attribution of missed PnL (carry/curve/basis/mark-out).
+
+Heatmap: tenor × currency of carry foregone.
+
+
+
+---
+
+9) Proxy-hedge slippage (where relevant)
+
+(Some desks use deliverable proxies or futures to dynamically hedge NDF risk intraday.)
+
+What you’re testing Does internalising voice flow force unwinds of proxy hedges at bad moments?
+
+Metrics
+
+Proxy slippage = PnL difference between actual unwind price and mid (or model best) at the decision timestamp.
+
+Gap to local hours: whether unwinds occur in thin liquidity.
+
+
+How to check
+
+Track the execution of proxy hedges tied to the eRisk position that was flattened.
+
+Attribute slippage to the internalisation trigger.
+
+
+Plots
+
+Scatter: proxy slippage vs TTF and vs liquidity score.
+
+Bars: average slippage by hour-of-day.
+
+
+
+---
+
+10) Governance & limits diagnostics
+
+What you’re testing Are house rules (inventory caps, client-priority, best-ex) causing value destruction in NDFs?
+
+Metrics
+
+Rule-trigger rate: % internalisations caused by a particular limit (inventory, tenor cap, segment preference).
+
+Value impact per rule: avg Net value add when that rule fired.
+
+
+How to check
+
+Log the reason code for each internalisation.
+
+Compute Saved–Lost by reason.
+
+
+Plots
+
+Waterfall: cumulative PnL impact by reason code.
+
+Pareto: top rules by negative Net value add.
+
+
+
+---
+
+Putting it together: a simple minimal dashboard
+
+1. Missed-to-fix PnL vs TTF (scatter, by currency).
+
+
+2. Saved cost vs Lost alpha (scatter, color by client segment).
+
+
+3. Inventory impact by tenor (histogram + stacked time series).
+
+
+4. Selective-policy frontier (risk–return across rules).
+
+
+5. Attribution bars (carry/curve/basis/mark-out of missed PnL).
+
+
+
+
+---
+
+Data you’ll want in every internalisation log row (NDFs)
+
+Timestamp, currency, tenor, notional, direction (USD buy/sell), price 
+
+TTF, local-hours flag, liquidity score
+
+eRisk pre-trade inventory by tenor, impact ratio
+
+Client segment (for voice), venue alt pricing (for Saved cost)
+
+Fixing rate , intraday mids 
+
+Points/carry decomposition (curve/basis), realised σ over TTF
+
+Reason code (limit/rule that triggered internalisation)
+
+
+If you want, I can draft a schema (column names + types) and a starter notebook outline (pseudo-code for each plot) so you can hand it to a quant/dev and get first charts up.
+
