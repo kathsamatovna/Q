@@ -1,0 +1,47 @@
+Here's how to do this join operation in q/kdb+:
+
+**Basic Join Syntax:**
+```q
+/ Left join fit table with catskill table
+result: fit_table lj `timeforce xkey select from catskill_table
+
+/ Or if you want to be more explicit about the key mapping:
+result: fit_table lj ([timeforce:OrderId] from catskill_table)
+```
+
+**Step by step:**
+
+1. **If your tables are already loaded:**
+```q
+/ Assuming your tables are called fit and catskill
+result: fit lj `timeforce xkey catskill
+```
+
+2. **If you need to key the catskill table first:**
+```q
+/ Key catskill table by OrderId, then join on timeforce
+catskill_keyed: `OrderId xkey catskill
+result: fit lj `timeforce xcol catskill_keyed
+```
+
+3. **More explicit approach:**
+```q
+/ Create the lookup mapping
+lookup: select timeforce:OrderId, other_cols from catskill
+lookup_keyed: `timeforce xkey lookup
+result: fit lj lookup_keyed
+```
+
+**Key q concepts here:**
+- `lj` = left join (keeps all records from left table)
+- `xkey` = sets the key column(s) 
+- `xcol` = renames columns if needed
+
+**If your column names don't match exactly:**
+```q
+/ Rename OrderId to timeforce in catskill, then join
+catskill_renamed: `timeforce xcol `OrderId`timeforce xcols catskill
+result: fit lj `timeforce xkey catskill_renamed
+```
+
+The result will give you all fit table records with matching catskill data appended where the timeforce values align with OrderId values.
