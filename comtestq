@@ -1,0 +1,259 @@
+Great — this is doable and interesting. Below I give a focused, runnable recipe (q snippets + a small Python permutation test) you can drop into your pipeline. The idea is:
+
+1. collapse child rows into parent orders (you already have parent size and child fillQty),
+
+
+2. build a time-ordered sequence of parent orders per trader,
+
+
+3. define short-gap / similar-size rules that indicate possible strategic splitting or timed placement,
+
+
+4. group consecutive parents that meet those rules into clusters (candidate “strategic sequences”),
+
+
+5. produce per-trader summary metrics and then test whether the clustering is stronger than random (permutation test / p-value).
+
+
+
+I’ll use placeholder column names — replace them with your real ones:
+
+parentId — parent order id
+
+traderId — trader id
+
+fillQty — child fill quantity
+
+parentSize (or orderSize) — the original parent order size (available on each child row)
+
+time — timestamp of the child row (use earliest child timestamp as parent start)
+
+
+
+---
+
+1) Collapse child rows → parent orders (q)
+
+/ t is your raw table of child rows
+/ produce one row per parentId (logical parent order)
+parents: select
+    trader: first traderId,
+    symbol: first symbol,
+    side: first side,
+    parentSize: first parentSize,    / original parent size recorded on each child row
+    totalFilled: sum fillQty,        / sum of child fills
+    nFills: count i,                 / number of child rows (how split it was)
+    startTime: min time,
+    endTime: max time,
+    avgFillSize: avg fillQty
+  by parentId
+  from t;
+
+/ / sort by start time so prev/next make sense
+parents: parents xasc startTime;
+
+Quick checks:
+
+/ parents where totalFilled<>parentSize  / partial fills / mismatch
+select from parents where totalFilled<>parentSize
+
+
+---
+
+2) Compute inter-parent features (q)
+
+Compute previous parent fields per trader, inter-parent gap, relative size difference, and a boolean flag that the previous parent is “similar & close”:
+
+/ thresholds you can tune
+thresholdGap: 00:05:00;    / e.g. 5 minutes
+thresholdSizeRel: 0.20;   / 20% relative size difference allowed
+
+/ attach previous parent values (per-trader)
+parents:update
+  prevStart: prev startTime,
+  prevSize:  prev parentSize,
+  prevSymbol: prev symbol,
+  prevSide:   prev side
+from parents by trader;
+
+/ / compute numeric measures
+parents:update
+  interGap: startTime - prevStart,
+  sizeRelDiff: $[prevSize=0; 0f; (abs parentSize - prevSize) % prevSize]
+from parents;
+
+/ / flag short+similar consecutive parents (candidate timed/split continuation)
+parents:update
+  shortSeq: (interGap < thresholdGap) & (sizeRelDiff < thresholdSizeRel) & (symbol = prevSymbol) & (side = prevSide)
+from parents;
+
+Interpretation:
+
+shortSeq true means this parent came soon after a previous parent by same trader, same symbol & side, and of similar size → candidate for intentional sequencing/splitting.
+
+
+
+---
+
+3) Group consecutive shortSeq into clusters (q)
+
+We want runs of parents where shortSeq is true (consecutive parents). We'll create a cluster id (per trader) and extract cluster stats.
+
+/ mark boundaries where sequence breaks
+parents:update seqBreak: not shortSeq from parents;
+
+/ / cluster id increments whenever there's a break; sums is running sum
+parents:update clusterId: 1 + sums seqBreak by trader from parents;
+
+/ / keep only the events that are part of short sequences
+clusters: select
+    clusterLen: count parentId,
+    clusterTotalVol: sum parentSize,
+    clusterMeanGap: avg interGap,
+    clusterMedSizeRel: med sizeRelDiff,
+    symbols: distinct symbol
+  by trader, clusterId
+  from parents
+  where shortSeq;
+
+/ / per-trader totals
+traderTotals: select totalParents: count parentId, totalVolume: sum parentSize by trader from parents;
+
+/ / how many parents are in clusters per trader
+clusteredParents: select clusteredParents: sum clusterLen by trader from clusters;
+
+/ / join and compute fraction in clusters
+traderClusterSummary: clusteredParents lj `trader xkey traderTotals;
+traderClusterSummary:update fracInClusters: 100.0 * clusteredParents % totalParents from traderClusterSummary;
+
+Useful output: traderClusterSummary shows for each trader the percent of their parent orders that belong to short/similar clusters. High % → likely deliberate sequencing.
+
+
+---
+
+4) Additional per-trader features to compute (quick q snippets)
+
+Calculate these to feed clustering or heuristics:
+
+/ split vs non-split behavior
+traderSplits: select
+  nParents: count parentId,
+  pctSplitParents: 100.0 * sum nFills>1 % count parentId,
+  meanPartsPerParent: avg nFills,
+  meanInterParentGap: avg interGap,
+  cvInterParentGap: dev interGap % avg interGap
+by trader
+from parents;
+
+/ / join with cluster summary
+traderFeatures: traderSplits lj `trader xkey traderClusterSummary;
+
+Interpret some quick heuristics:
+
+high pctSplitParents + high fracInClusters → trader often submits large parents and then quickly follows with similarly sized parents (possible deliberate staggering).
+
+low meanInterParentGap + low meanPartsPerParent but many clustered parents → trader submits many whole parent orders back-to-back (timing strategy).
+
+clusterMeanGap small and clusterLen > 2 → multi-parent burst.
+
+
+
+---
+
+5) Visual checks (what to plot)
+
+Timeline per trader: points = parent start times, size = parentSize, color = clusterId. (Quickly shows bursts.)
+
+Scatter: interGap vs sizeRelDiff colored by shortSeq / cluster membership.
+
+Heatmap: time-of-day (bins) × count of clustered events (shows repeated schedules).
+
+Per-trader cluster summary table: select mean clusterLen, max clusterLen, fracInClusters by trader from traderClusterSummary (to sort and inspect tops).
+
+
+I can give plotting code if you want (matplotlib/pandas).
+
+
+---
+
+6) Statistical test: are sequences more than random? (Python permutation test)
+
+A simple permutation test: for each trader, count number of parent pairs within thresholdGap (or number of clustered parents). Shuffle the parent times within the trading day many times to get a null distribution and compute p-value.
+
+# python: permutation test for one trader
+import numpy as np
+import pandas as pd
+
+def count_close_pairs(times, threshold_seconds=300):
+    times = np.sort(times.astype('datetime64[s]').astype('int'))
+    # count consecutive pairs with gap < threshold
+    gaps = np.diff(times)
+    return np.sum(gaps < threshold_seconds)
+
+def permutation_pval(times, threshold_seconds=300, nperm=1000, seed=1):
+    rng = np.random.default_rng(seed)
+    obs = count_close_pairs(times, threshold_seconds)
+    day_start = np.datetime64(times.astype('datetime64[D]')[0])  # same day baseline
+    day_end = day_start + np.timedelta64(1,'D')
+    # convert to seconds relative to midnight for easy shuffling
+    rel_secs = (times - day_start).astype('timedelta64[s]').astype(int)
+    perm_counts = []
+    for _ in range(nperm):
+        perm = rng.permutation(rel_secs)
+        perm_times = day_start + perm.astype('timedelta64[s]')
+        perm_counts.append(count_close_pairs(perm_times, threshold_seconds))
+    pval = (np.sum(np.array(perm_counts) >= obs) + 1) / (nperm + 1)
+    return obs, perm_counts, pval
+
+# usage example (times = numpy array or pd.Series of timestamps)
+
+Interpretation:
+
+small p-value (e.g. <0.05) → timings are unlikely under random placement — evidence of deliberate timing/packing.
+
+
+You can extend the test to preserve per-day counts (shuffle within each day), or shuffle across the whole sample window depending on seasonality.
+
+
+---
+
+7) More advanced sequence/pattern methods (options)
+
+Sequence clustering / DTW: treat each trader as a time series of parent sizes and gaps; cluster with DTW (use tslearn) to find repeated sequencing patterns.
+
+Hidden Markov Models: detect regimes (quiet vs burst) per trader.
+
+Change-point detection: flag when trader behavior shifts (sudden increase in clustering).
+
+HDBSCAN on the parent-level feature vectors (gap, sizeRelDiff, side, symbol encoded) to find small-but-cohesive sequence clusters (good for low-volume anomalies).
+
+
+
+---
+
+8) Practical tuning suggestions
+
+Tune thresholdGap per instrument — equities vs FX have different timescales. Start with 5m / 1m / 30s and compare.
+
+thresholdSizeRel — 10%–30% is typical depending how strictly you want “same size.”
+
+Require same symbol & side to reduce false positives.
+
+For market-impact motives, also check price move after the cluster (does mid move in direction of the cluster?) — join to your quote/book table.
+
+
+
+---
+
+9) Next steps I can do now (pick any)
+
+adapt the q snippets to your exact column names (paste a small sample of 8–12 rows) and I’ll return runnable code.
+
+give the matplotlib / pandas notebook to run the permutation test and plotting for the top N suspicious traders.
+
+add code to join quote/book snapshots to compute price response after clusters (to check whether sequences move price).
+
+produce a pure-q clustering approach (kmeans or simple DBSCAN) if you prefer to keep everything inside kdb.
+
+
+
