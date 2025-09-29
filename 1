@@ -1,0 +1,104 @@
+If it’s one trader, you can treat it as a 1-D clustering in time (order arrival times). That makes picking eps and minPts much simpler and you can even do a DBSCAN-equivalent in pure q.
+
+What the params mean here
+
+eps (in seconds/minutes): the max intra-burst gap you still consider “same burst”.
+
+minPts: the minimum orders you require to call a burst a real cluster (e.g., 5 child orders).
+
+
+Practical ways to choose them
+
+A) Heuristic from inter-arrival gaps (fast & works well in 1-D)
+
+1. Compute inter-arrival time dt = time - prev time.
+
+
+2. Look at the distribution of dt. You’ll usually see short gaps (within bursts) and long gaps (between bursts).
+
+
+3. Pick eps near the valley that separates those two regimes (e.g., between the short-gap mode and long-gap mode).
+
+Quick rule if you don’t want to hunt valleys: eps = 90th percentile of dt limited to small values (clip big outliers first).
+
+
+
+4. Set minPts to the smallest burst size worth flagging (e.g., 5–10). If you only want chunky bursts, raise it (e.g., 15–20).
+
+
+
+B) k-distance elbow (textbook DBSCAN)
+
+Choose k = minPts−1.
+
+For each order (time point), compute distance to its k-th nearest time neighbour (in 1-D that’s just the k-th closest timestamp).
+
+Sort those distances; the elbow ≈ eps.
+
+If you get too much noise, nudge eps up a bit; if clusters merge, nudge it down or raise minPts.
+
+
+
+---
+
+Pure q implementation (1-D DBSCAN equivalent)
+
+Assume orders has one trader’s rows with a time column.
+
+/ 1) Sort and compute inter-arrival times
+t: `time xasc orders
+t: update dt: time - prev time from t
+
+/ 2) Choose eps heuristically from dt
+/ (simple: ignore top 5% giant gaps, take 90th pct of the rest)
+p: 0.95
+cut: first value (raze where sums 1b)=ceil p*count t     / index for 95th pct
+dts: asc t`dt
+trim: dts til cut
+eps: 0N; 
+if[count trim>0; eps: trim floor 0.90*count trim]        / 90th pct of trimmed
+/ Fallback if no dt yet (tiny sample):
+if[null eps; eps: 00:00:30]                               / e.g., 30 seconds
+
+/ 3) Pick minPts according to “burst” you care about
+minPts: 5
+
+/ 4) 1-D DBSCAN equivalent: group consecutive rows where gap<=eps
+/    Any run with length>=minPts is a cluster; others are noise
+grp: 1 + sums not (t`dt<=eps)                             / new group when gap>eps
+lab: raze {(n gcount x)>=minPts} peach value grp          / boolean: cluster vs noise
+/ Assign cluster ids (0 for noise, 1.. for clusters)
+cid: 0N!0N
+/ Map each group to either 0 (noise) or a running cluster id
+iscl: exec any lab by grp
+ids: 0N!0N
+ids: raze (til sum iscl) + 1 where iscl                   / 1..K
+labByGrp: (enlist grp)! raze (iscl#ids),((not iscl)#0)    / map grp->clusterId or 0
+t: update cluster: labByGrp grp from t
+
+/ Result: t has a `cluster` column (0 = noise; 1..K = bursts)
+
+Tweaks
+
+If you’re getting too many small clusters, increase minPts.
+
+If bursts merge together, reduce eps.
+
+If you care about size info, you can do a 2-D variant by combining time with a size feature (e.g., log qty or qty/orderSize), but then you should z-score features and use Python’s DBSCAN via EmbedPy.
+
+
+
+---
+
+Quick sanity checks
+
+Plot cumulative orders vs time: bursts show as steep stairs; eps should be shorter than the flat gaps between those steep sections.
+
+Count clusters and noise:
+
+
+/ counts per label
+select n:count i by cluster from t
+
+If you want, I can also show the tiny EmbedPy snippet to compute the k-distance elbow and run real DBSCAN on [time, log qty, fraction] with proper scaling, then bring labels back into q.
+
