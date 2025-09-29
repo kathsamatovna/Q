@@ -1,0 +1,90 @@
+Good — let’s slow this down and make it concrete.
+
+You’ve got one trader’s order timestamps. Imagine lining them up:
+
+09:00:01   09:00:02   09:00:03             09:05:10   09:05:11   ...
+
+
+---
+
+1. What dt means
+
+dt = time(i) − time(i−1) = the gap between consecutive orders.
+
+So if the trader fires two orders back-to-back, dt might be 1–2 seconds.
+
+If the trader takes a break, dt might be minutes.
+
+
+
+---
+
+2. What the distribution tells you
+
+When you collect all those gaps (dt), you’ll see two kinds of values:
+
+Short gaps (clustered activity) → bursts of orders, orders within seconds of each other.
+
+Long gaps (between clusters) → trader paused before the next burst.
+
+
+That’s what I meant by “short vs long gaps.”
+
+If you plot a histogram of dt, you’ll often see a spike at the short end and a long tail at the high end. The valley in between is the threshold where you can separate within-burst vs between-burst. That threshold is your candidate for eps.
+
+
+---
+
+3. How many bins?
+
+It depends on how many orders you have:
+
+If you have hundreds of orders, try 50–100 bins.
+
+If you have thousands, you can go higher, e.g. 100–200 bins.
+
+The goal: bins fine enough to see the shape, but not so fine that it looks like noise.
+
+
+Quick q one-liner:
+
+/ Assume dt is in seconds
+hist: histogram[100; dt%1000]  / 100 bins, scale if dt is in ms
+
+
+---
+
+4. How to pick eps from the histogram
+
+Look at the plot.
+
+If you see:
+
+Peak near 0–2 sec (lots of small gaps).
+
+Gap in counts between, say, 5–30 sec.
+
+Then a long tail out to minutes/hours.
+
+
+That dip between the peak and the tail is your cutoff.
+
+Example: if most bursts are within 5 sec, but there’s a trough around 20 sec, pick eps ≈ 20 sec.
+
+
+
+
+---
+
+5. What about minPts?
+
+This is now easier: once eps defines “neighbours,” minPts just says how many consecutive orders must be in that tight window before we call it a cluster.
+
+For a single trader, I’d start minPts=5 (5 orders in quick succession = a burst).
+
+
+
+---
+
+👉 Would it help if I mocked up a little example dataset (timestamps + histogram of dt) so you can see what the short/long gaps separation looks like visually?
+
