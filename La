@@ -1,0 +1,270 @@
+Perfect — let’s do this super step-by-step, assuming:
+
+You have a pandas DataFrame df with one trader’s orders.
+
+There’s a timestamp column (call it time) and some numeric columns like qty, orderSize, and maybe a string side (“buy”/“sell”).
+
+Your inter-arrival time (dt) is (or will be) measured in nanoseconds.
+
+
+I’ll give you two copy-pasteable paths:
+
+1. Time-only DBSCAN (the simplest, uses just time to find bursts)
+
+
+2. Multi-feature DBSCAN (add size/side info; slightly more advanced)
+
+
+
+
+---
+
+Path A — Time-only DBSCAN (fast & reliable for bursts)
+
+Concept in one line: Put each order on a 1-D time axis. DBSCAN groups orders that are no more than eps seconds apart, as long as there are at least min_samples in that neighborhood.
+
+A1) Minimal requirements
+
+df['time'] must be a pandas datetime64[ns] or an integer nanoseconds since epoch.
+
+Only one trader in df. (If you have many traders, run this per trader.)
+
+
+A2) Code (copy-paste)
+
+# ---------- imports ----------
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+
+# ---------- 1) Clean + sort ----------
+# Make sure df['time'] is datetime64[ns]. If it's int ns, convert:
+if np.issubdtype(df['time'].dtype, np.integer):
+    df = df.assign(time=pd.to_datetime(df['time']))
+
+# Keep only the columns we need for now
+df = df[['time', 'qty', 'orderSize', 'side']].copy() if set(['qty','orderSize','side']).issubset(df.columns) else df[['time']].copy()
+df = df.dropna(subset=['time']).sort_values('time').reset_index(drop=True)
+
+# ---------- 2) Build 1-D time feature in SECONDS ----------
+# (DBSCAN expects numeric features; we use seconds because eps will be in seconds)
+t0 = df['time'].iloc[0]
+df['t_sec'] = (df['time'] - t0).dt.total_seconds().astype('float64')
+
+# ---------- 3) Choose parameters ----------
+# eps = max allowed gap (in seconds) to still be the same burst.
+# min_samples = minimum orders to call it a real burst.
+# START with eps=20s and min_samples=5 (tweak later)
+eps_seconds   = 20.0
+min_samples   = 5
+
+# ---------- 4) Run DBSCAN on 1D time ----------
+X = df[['t_sec']].to_numpy()   # shape (n, 1)
+db = DBSCAN(eps=eps_seconds, min_samples=min_samples, metric='euclidean')
+labels = db.fit_predict(X)
+
+# labels: -1 = noise, 0..K = cluster IDs
+df['cluster'] = labels
+
+# ---------- 5) Summarise clusters ----------
+is_cluster = df['cluster'] >= 0
+summary = (df[is_cluster]
+           .groupby('cluster')
+           .agg(start=('time','min'),
+                end=('time','max'),
+                n_orders=('time','size'))
+           .sort_values('start')
+           .reset_index())
+
+print(summary.head(10))
+
+A3) How to pick eps and min_samples (time-only)
+
+eps_seconds = max gap inside a burst. If you think “orders inside a burst are ≤ 15–30s apart”, pick 15–30.
+
+min_samples = smallest burst size you care about.
+
+Want only chunky bursts? Use 10–20.
+
+Want micro-bursts? Use 3–5.
+
+
+
+> If you want a data-driven eps, compute inter-arrival times and take a high percentile of the small gaps:
+
+
+
+# Inter-arrival gaps in *seconds* (your dt is in ns, we compute it here directly from time)
+dt_sec = df['time'].diff().dt.total_seconds().dropna()
+
+# ignore huge gaps (top 5%), then take the 90th percentile of the rest as eps
+cut = dt_sec.quantile(0.95)
+eps_seconds = dt_sec[dt_sec <= cut].quantile(0.90)
+eps_seconds = float(max(eps_seconds, 1.0))  # sane floor like 1s
+min_samples = 5
+
+db = DBSCAN(eps=eps_seconds, min_samples=min_samples).fit(df[['t_sec']].to_numpy())
+df['cluster'] = db.labels_
+
+That’s it. You now have bursts as cluster IDs in df['cluster'] (−1 = noise).
+
+
+---
+
+Path B — Multi-feature DBSCAN (time + size + side)
+
+Why do this: If you care that bursts are not only close in time, but also look similar (e.g., many small child orders, or mostly buys), add features.
+Important: When mixing features, you standardise them first (so seconds, quantities, and 0/1 booleans are comparable). Then eps is in z-score units, not seconds.
+
+B1) Features we’ll use
+
+Time density: dt_sec (short within bursts)
+
+Relative size: frac = qty / orderSize (bounded 0..1)
+
+Direction: isBuy = 1 if side=="buy" else 0
+
+
+You can add more (e.g., log1p(qty)), but keep it simple first.
+
+B2) Code (copy-paste)
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+
+# ---------- 1) Clean + sort ----------
+if np.issubdtype(df['time'].dtype, np.integer):
+    df = df.assign(time=pd.to_datetime(df['time']))
+
+df = df.sort_values('time').reset_index(drop=True)
+
+# ---------- 2) Build base features ----------
+# dt in *seconds* from your ns timestamps
+df['dt_sec'] = df['time'].diff().dt.total_seconds()
+df['dt_sec'] = df['dt_sec'].fillna(df['dt_sec'].median())  # fill the first NaN safely
+
+# fraction of parent filled (only if columns exist)
+if set(['qty','orderSize']).issubset(df.columns):
+    df['frac'] = (df['qty'] / df['orderSize']).clip(lower=0, upper=1).fillna(0.0)
+else:
+    df['frac'] = 0.0
+
+# side to 0/1 (only if exists)
+if 'side' in df.columns:
+    df['isBuy'] = (df['side'].str.lower() == 'buy').astype('float64')
+else:
+    df['isBuy'] = 0.0
+
+# ---------- 3) Pick features & scale ----------
+features = ['dt_sec','frac','isBuy']  # keep it small & meaningful
+X = df[features].astype('float64').to_numpy()
+scaler = StandardScaler()
+Xz = scaler.fit_transform(X)
+
+# ---------- 4) Pick min_samples, get eps via k-distance elbow ----------
+min_samples = 5  # start here; increase if you only want strong bursts
+
+# k = min_samples (sklearn uses inclusive definition)
+nn = NearestNeighbors(n_neighbors=min_samples, metric='euclidean')
+nn.fit(Xz)
+dists, _ = nn.kneighbors(Xz)
+
+# distance to the k-th neighbor (last column), sorted
+kdist = np.sort(dists[:, -1])
+
+# A simple elbow heuristic:
+# take the 90th percentile as a first cut; you can inspect/plot kdist to refine.
+eps = float(np.percentile(kdist, 90))
+
+# ---------- 5) Run DBSCAN ----------
+db = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean')
+labels = db.fit_predict(Xz)
+df['cluster'] = labels  # -1 is noise
+
+# ---------- 6) Summaries ----------
+summary = (df[df['cluster']>=0]
+           .groupby('cluster')
+           .agg(start=('time','min'),
+                end=('time','max'),
+                n_orders=('time','size'),
+                sum_qty=('qty','sum'))
+           .sort_values('start')
+           .reset_index())
+print("eps (z-units):", eps)
+print(summary.head(10))
+
+Notes you can just follow:
+
+In multi-feature space, eps ≈ 0.3–1.5 is common after standardisation. If you get everything merged, lower eps; if everything is noise, raise eps a bit or lower min_samples.
+
+If orderSize has zeros, we clip frac safely.
+
+Avoid one-hotting huge categoricals like parentId/symbol. Either run per symbol or drop them.
+
+
+
+---
+
+FAQ you’ll hit (and what to do)
+
+Q: My dt is in nanoseconds already — what do I do?
+A: If it’s a column like dt_ns (ints), convert to seconds for features:
+
+df['dt_sec'] = df['dt_ns'] / 1e9
+
+If you have timestamps, I already did diff().dt.total_seconds().
+
+Q: I picked eps via histogram of dt_sec. Do I still need k-NN?
+A: No. k-distance plot is just to choose eps. If you already have a good eps, skip k-NN and run DBSCAN.
+
+Q: Strings in my DataFrame?
+A: Keep only small, meaningful categoricals (e.g., side → isBuy). Drop IDs (orderId, parentId) from features (use them later for reporting).
+
+Q: How do I know if my parameters are good?
+A: After clustering:
+
+Too many tiny clusters/noise → increase eps a bit or decrease min_samples.
+
+One giant blob → decrease eps or increase min_samples.
+
+Sanity-check with a cumulative orders step-chart; bursts should align with steep sections.
+
+
+
+---
+
+Optional: quick cumulative step-chart (visual check)
+
+import matplotlib.pyplot as plt
+
+# Cumulative count
+df = df.sort_values('time').reset_index(drop=True)
+df['cum'] = np.arange(1, len(df)+1)
+
+# Plot
+plt.figure()
+plt.step(df['time'], df['cum'], where='post')
+plt.title('Cumulative orders (step chart)')
+plt.xlabel('Time'); plt.ylabel('Cumulative orders')
+plt.tight_layout(); plt.show()
+
+
+---
+
+What to hand your boss
+
+The summary table (cluster start/end, number of orders, sum of qty).
+
+A screenshot of the step chart with bursts highlighted (optional: color by cluster).
+
+Your chosen eps and min_samples and one sentence:
+“Clusters = at least <min_samples> orders no more than <eps> seconds apart (time-only)”
+or
+“Clusters based on time-density + size + side (features z-scored; eps = <eps> in z-units).”
+
+
+If you paste a few rows of your real column names (you can scrub values), I’ll tailor the exact 6–10 lines that select features and run DBSCAN for your dataset.
+
