@@ -1,0 +1,75 @@
+Shortest path:
+
+In scikit-learn, DBSCAN marks noise as label -1.
+
+Filter those rows out, then (optionally) re-index cluster IDs to be 0…K-1.
+
+
+Here are copy-paste snippets for the common cases.
+
+NumPy array X
+
+from sklearn.cluster import DBSCAN
+import numpy as np
+
+db = DBSCAN(eps=0.5, min_samples=5).fit(X)
+labels = db.labels_                 # shape (n_samples,)
+mask = labels != -1                 # True = keep (not noise)
+X_clean = X[mask]
+labels_clean = labels[mask]
+
+# optional: make labels contiguous (0..K-1)
+uniq = np.unique(labels_clean)
+relabel = {old:i for i, old in enumerate(uniq)}
+labels_clean = np.vectorize(relabel.get)(labels_clean)
+
+pandas DataFrame df
+
+Assume your features are in columns feat_cols.
+
+from sklearn.cluster import DBSCAN
+
+X = df[feat_cols].to_numpy()
+labels = DBSCAN(eps=0.5, min_samples=5).fit_predict(X)
+df["cluster"] = labels
+
+# drop noise rows
+df_no_noise = df[df["cluster"] != -1].copy()
+
+# optional: re-index cluster ids
+mapping = {old:i for i, old in enumerate(sorted(df_no_noise["cluster"].unique()))}
+df_no_noise["cluster"] = df_no_noise["cluster"].map(mapping)
+
+Plotting without noise
+
+import matplotlib.pyplot as plt
+mask = labels != -1
+plt.scatter(X[mask,0], X[mask,1], c=labels[mask], s=8)
+
+
+---
+
+Tips to “remove” fewer points as noise (i.e., tune DBSCAN)
+
+Scale your features (very important if you have time in nanoseconds + other features):
+X = StandardScaler().fit_transform(X) or scale each feature to comparable units.
+
+Choose eps with a k-distance plot: use NearestNeighbors(n_neighbors=min_samples); plot sorted distances to the k-th neighbor and look for the elbow; that value is a good starting eps.
+
+Adjust min_samples: larger ⇒ more conservative (more noise), smaller ⇒ fewer points flagged as noise.
+
+Try a different metric (metric="manhattan", "cosine", etc.) if distances are skewed.
+
+If clusters have varying density, consider HDBSCAN (labels -1 are still noise, but it handles variable density better).
+
+
+Removing tiny clusters as “noise”
+
+Sometimes you also want to drop clusters smaller than a threshold:
+
+counts = df["cluster"].value_counts()
+small = counts[counts < 20].index
+df_pruned = df[~df["cluster"].isin([-1, *small])].copy()
+
+That’s it: filter label != -1 to drop noise; tune eps/min_samples and scaling to control how much gets labeled as noise.
+
