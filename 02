@@ -1,0 +1,74 @@
+ with plotting DBSCAN clusters.
+
+1. After fitting DBSCAN
+
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Example dataset (replace with yours)
+X = np.random.rand(100, 2)
+
+# Run DBSCAN
+db = DBSCAN(eps=0.1, min_samples=5).fit(X)
+labels = db.labels_
+
+Each point gets a labels[i].
+
+Noise points have label = -1.
+
+
+
+---
+
+2. Plot clusters with noise shown
+
+# Unique cluster IDs
+unique_labels = set(labels)
+
+# Make a color map (so each cluster has a different color)
+colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+
+for cluster_id, color in zip(unique_labels, colors):
+    mask = (labels == cluster_id)
+
+    if cluster_id == -1:
+        # Noise = black dots
+        plt.scatter(X[mask, 0], X[mask, 1], c="k", marker="x", label="noise")
+    else:
+        plt.scatter(X[mask, 0], X[mask, 1], c=[color], label=f"cluster {cluster_id}")
+
+plt.legend()
+plt.show()
+
+This gives you a scatter plot:
+
+Each cluster = different color
+
+Noise = black x marks
+
+
+
+---
+
+3. If you want to remove noise first
+
+mask = labels != -1
+plt.scatter(X[mask, 0], X[mask, 1], c=labels[mask], cmap="tab10")
+plt.show()
+
+
+---
+
+✅ That’s all you need:
+
+labels == -1 → noise (plot separately)
+
+other labels → real clusters
+
+
+
+---
+
+Do you want me to show you the same plotting but for a pandas DataFrame (e.g. if your data isn’t in a NumPy array)?
+
