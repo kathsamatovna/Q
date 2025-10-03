@@ -1,0 +1,184 @@
+ DBSCAN + the k-distance plot feel mechanical and obvious, and clear up the X[:, 0] / X[:, 1] business.
+
+1) Build a clean feature matrix for order-flow
+
+For DBSCAN you pass a 2D array X of shape (n_samples, n_features). You choose the features. For order-flow, a simple, good starter set is:
+
+interarrival time (convert to seconds; heavy-tailed → use log1p)
+
+order quantity (also heavy-tailed → log1p)
+
+side (encode buy/sell as a number, e.g., +1 for buy, -1 for sell)
+
+
+Then scale features so one doesn’t dominate the distance.
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+
+# Suppose df has: 'ts' (ns), 'qty', 'side' as strings "BUY"/"SELL"
+df = df.sort_values('ts')
+dt_ns = df['ts'].diff().fillna(0).to_numpy()
+interarrival_s = dt_ns / 1e9
+
+side_num = np.where(df['side'].str.upper().eq('BUY'), 1.0, -1.0)
+
+X_raw = np.column_stack([
+    np.log1p(interarrival_s),   # column 0
+    np.log1p(df['qty'].to_numpy()),  # column 1
+    side_num                    # column 2
+])
+
+scaler = RobustScaler()  # robust to outliers
+X = scaler.fit_transform(X_raw)
+
+> Important: the order of columns you stack defines what X[:, 0], X[:, 1], etc. mean. In the snippet above:
+
+X[:, 0] = (scaled) log interarrival
+
+X[:, 1] = (scaled) log qty
+
+X[:, 2] = (scaled) side (+1/−1)
+
+
+
+
+2) What does X[:, 0] and X[:, 1] mean?
+
+X is a 2D matrix.
+
+The first index is rows (samples/trades), the second is columns (features).
+
+: means “all rows”.
+
+X[:, 0] = take all rows, column 0 (your first feature).
+
+X[:, 1] = all rows, column 1 (second feature).
+
+People often plot just 2 columns for a 2D scatter:
+
+plt.scatter(X[:, 0], X[:, 1], s=8)
+
+That’s “feature 0 on the x-axis vs feature 1 on the y-axis”.
+
+If you have >2 features, a 2D scatter can only show two at a time. You either:
+
+pick two that you care about (e.g., interarrival vs qty), or
+
+reduce to 2D (PCA/UMAP) for visualization only, while running DBSCAN on the full feature set.
+
+
+
+3) Choose min_samples
+
+A sturdy default: min_samples ≈ 2 × (number of features).
+
+With 3 features (interarrival, qty, side), try min_samples=6–10.
+
+For noisy market data, values like 10–30 are common; larger catches denser “real” clusters and treats sparse bursts as noise.
+
+
+4) Make the k-distance plot (a.k.a. kNN-distance plot)
+
+This is how you pick eps.
+
+Decide k = min_samples.
+
+For each point, compute the distance to its k-th nearest neighbor.
+
+Sort those distances ascending and plot them.
+
+Look for the elbow/knee where the curve sharply “bends upward”.
+That y-value is a good eps.
+
+
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+import matplotlib.pyplot as plt
+
+min_samples = 10  # try a few values
+k = min_samples
+
+nbrs = NearestNeighbors(n_neighbors=k, metric='euclidean')
+nbrs.fit(X)
+distances, _ = nbrs.kneighbors(X)
+
+# take the distance to the k-th neighbor (index k-1)
+kdist = np.sort(distances[:, k-1])
+
+plt.figure()
+plt.plot(kdist)
+plt.xlabel('Points sorted by distance to k-th neighbor')
+plt.ylabel(f'Distance to {k}-th neighbor')
+plt.title('k-distance plot (use elbow as eps)')
+plt.show()
+
+How to pick the elbow concretely:
+
+Eyeball: find the point where the slope starts increasing steeply.
+
+Sanity-check by trying a range around that knee: e.g., eps in [0.8×, 1.0×, 1.2× knee].
+
+If your features are well-scaled, a good eps is often in the ballpark of 0.3–1.5 for Euclidean.
+
+
+Tips if the k-distance plot has no clean knee:
+
+Your features might need different scaling (try StandardScaler or try removing a feature that’s not informative).
+
+Try a different distance metric (metric='manhattan') if tails are extreme.
+
+Increase min_samples to suppress noise, or decrease to reveal smaller clusters.
+
+
+5) Run DBSCAN and plot clusters
+
+from sklearn.cluster import DBSCAN
+
+eps = 0.7   # from the knee guess
+db = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean').fit(X)
+labels = db.labels_              # -1 means noise, 0..K are cluster IDs
+
+# quick 2D plot: pick the two features you want to SEE
+i, j = 0, 1  # 0=interarrival, 1=qty from our definition above
+plt.figure()
+for lab in np.unique(labels):
+    mask = labels == lab
+    if lab == -1:
+        plt.scatter(X[mask, i], X[mask, j], s=8, alpha=0.5, label='noise')
+    else:
+        plt.scatter(X[mask, i], X[mask, j], s=8, alpha=0.8, label=f'cluster {lab}')
+plt.xlabel(['log interarrival (scaled)', 'log qty (scaled)', 'side (scaled)'][i])
+plt.ylabel(['log interarrival (scaled)', 'log qty (scaled)', 'side (scaled)'][j])
+plt.legend()
+plt.title('DBSCAN clusters (plotted on chosen 2D projection)')
+plt.show()
+
+> Again: we ran DBSCAN on all features in X. The plot is just a 2D view using the two columns you selected with i and j. If you swap to i=0, j=2, you’ll see clusters projected into (interarrival vs side) space, etc. The content of “feature 0/1/2” is exactly the order you stacked them earlier.
+
+
+
+6) Practical order-flow tweaks
+
+Consider using time-of-day cyclic features (e.g., sin/cos(2π·seconds_in_day/86400)) if you think sessions matter.
+
+If burstiness matters, add a short moving average of interarrival or an event count in a trailing window.
+
+If buy/sell magnitude asymmetry matters, multiply qty by side and drop the separate side feature (so positive qty=buy, negative=sell). Then you’re in 2D: (log interarrival, signed log qty).
+
+
+7) Common pitfalls
+
+Passing strings (e.g., “BUY”/“SELL”) directly → don’t. Encode numerically first.
+
+Not scaling → eps becomes meaningless across features.
+
+Expecting a single “correct” eps → it’s a hyperparameter; use the k-distance knee as a starting point, then iterate.
+
+
+
+---
+
+If you want, paste a tiny sample of your columns (ts in ns, qty, side) and I’ll compute a k-distance curve and suggest an eps from it.
+
