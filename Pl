@@ -1,0 +1,95 @@
+Nice — you’ve got the DBSCAN pipeline working per day 👍.
+Now let’s add plots so you can see the clusters.
+
+
+---
+
+1. Pick which features to plot
+
+Your X_raw has 3 features (in order):
+
+column 0 = log1p(interarrival_s)
+
+column 1 = log1p(qty)
+
+column 2 = side_num
+
+
+Since you can only plot 2D easily, you need to pick two features (commonly interarrival vs qty).
+
+
+---
+
+2. Modify your function to return both labels and X
+
+We’ll return the scaled matrix too so we can plot:
+
+def run_dbscan_one_day(df_day, min_samples=10):
+    df_day = df_day.sort_values('ts').copy()
+    df_day['interarrival_s'] = df_day['ts'].diff().fillna(0).clip(lower=0)
+
+    side_num = np.where(df_day['side'].str.upper().eq('BUY'), 1.0, -1.0)
+    X_raw = np.column_stack([
+        np.log1p(df_day['interarrival_s'].to_numpy()),
+        np.log1p(df_day['qty'].to_numpy()),
+        side_num
+    ])
+    X = RobustScaler().fit_transform(X_raw)
+
+    k = min_samples
+    kdist = np.sort(NearestNeighbors(n_neighbors=k).fit(X).kneighbors(X)[0][:, k-1])
+    eps_guess = np.quantile(kdist, 0.9)
+
+    labels = DBSCAN(eps=eps_guess, min_samples=min_samples).fit_predict(X)
+    df_day['cluster'] = labels
+    return df_day, eps_guess, X, labels
+
+
+---
+
+3. Run per day and plot
+
+import matplotlib.pyplot as plt
+
+out = []
+for d, g in df.groupby('day', sort=True):
+    labeled, eps_used, X, labels = run_dbscan_one_day(g, min_samples=10)
+    out.append(labeled.assign(eps_used=eps_used))
+
+    # plot clusters for this day
+    plt.figure(figsize=(6,5))
+    for lab in np.unique(labels):
+        mask = labels == lab
+        if lab == -1:
+            plt.scatter(X[mask, 0], X[mask, 1], s=10, alpha=0.4, c='grey', label='noise')
+        else:
+            plt.scatter(X[mask, 0], X[mask, 1], s=10, alpha=0.8, label=f'cluster {lab}')
+    plt.xlabel('log interarrival (scaled)')
+    plt.ylabel('log qty (scaled)')
+    plt.title(f'Day {d} — DBSCAN eps={eps_used:.2f}')
+    plt.legend()
+    plt.show()
+
+df_labels = pd.concat(out, ignore_index=True)
+
+
+---
+
+4. Interpreting the plot
+
+X-axis = interarrival time feature
+
+Y-axis = order quantity feature
+
+Color = cluster id
+
+Grey = noise (-1)
+
+
+If you want to see side instead, replace X[:,0]/X[:,1] with X[:,0]/X[:,2], etc.
+
+
+---
+
+👉 Do you want me to also show you how to do the k-distance plot per day (so you can eyeball the elbow for eps instead of my np.quantile shortcut)?
+
