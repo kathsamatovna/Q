@@ -1,0 +1,220 @@
+Great question—multiple days changes a lot. You’ve got (at least) three sane ways to handle it; pick based on what you’re trying to find.
+
+1) Run DBSCAN per day/session (most common)
+
+Market regimes + volumes shift day-to-day. If you mix all days, one global eps is rarely right.
+
+What to do:
+
+Split by trading day (or session).
+
+Recompute interarrival within each day so overnight gaps don’t explode the scale.
+
+Scale within each day (Robust/StandardScaler).
+
+Choose min_samples and the knee-based eps per day (k-distance plot).
+
+Run DBSCAN for each day; keep labels as (day, cluster_id).
+
+
+import numpy as np, pandas as pd
+from sklearn.preprocessing import RobustScaler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+
+def run_dbscan_one_day(df_day, min_samples=10):
+    # interarrival within the day
+    df_day = df_day.sort_values('ts').copy()
+    df_day['interarrival_s'] = df_day['ts'].diff().fillna(0).clip(lower=0)
+
+    side_num = np.where(df_day['side'].str.upper().eq('BUY'), 1.0, -1.0)
+    X_raw = np.column_stack([
+        np.log1p(df_day['interarrival_s'].to_numpy()),
+        np.log1p(df_day['qty'].to_numpy()),
+        side_num
+    ])
+    X = RobustScaler().fit_transform(X_raw)
+
+    # pick eps via k-distance elbow (you can automate or eyeball)
+    k = min_samples
+    kdist = np.sort(NearestNeighbors(n_neighbors=k).fit(X).kneighbors(X)[0][:, k-1])
+    eps_guess = np.quantile(kdist, 0.9)  # heuristic; or find elbow programmatically
+
+    labels = DBSCAN(eps=eps_guess, min_samples=min_samples).fit_predict(X)
+    df_day['cluster'] = labels
+    return df_day, eps_guess
+
+df['day'] = pd.to_datetime(df['ts'], unit='s').dt.date  # assuming ts is in seconds
+out = []
+for d, g in df.groupby('day', sort=True):
+    labeled, eps_used = run_dbscan_one_day(g, min_samples=10)
+    out.append(labeled.assign(eps_used=eps_used))
+df_labels = pd.concat(out, ignore_index=True)
+
+Pros: simple, robust to regime changes.
+Cons: clusters are day-local; to compare across days, summarize each day’s clusters (centroids/stats) and match them by nearest-centroid if needed.
+
+2) Make DBSCAN time-aware and run once
+
+If you specifically want clusters that are compact in feature space and in time, add a time feature and weight it.
+
+Idea:
+
+Create t_in_day = seconds since session open (or z-score time within day).
+
+Build X = [log1p(interarrival), log1p(qty), side_num, w_time * zscore(t_in_day)].
+
+Tune w_time (e.g., 0.1–3). Larger w_time forces clusters to be locally time-contiguous.
+
+Then do one global k-distance plot and DBSCAN.
+
+
+from sklearn.preprocessing import StandardScaler
+
+df = df.sort_values(['day','ts']).copy()
+df['t_in_day'] = df.groupby('day')['ts'].transform(lambda s: s - s.iloc[0])
+
+features = []
+features.append(np.log1p(df.groupby('day')['ts'].diff().fillna(0).clip(lower=0).to_numpy()))
+features.append(np.log1p(df['qty'].to_numpy()))
+features.append(np.where(df['side'].str.upper().eq('BUY'), 1.0, -1.0))
+t_scaled = StandardScaler().fit_transform(df[['t_in_day']]).ravel()
+w_time = 0.5  # try a few values
+features.append(w_time * t_scaled)
+
+X = np.column_stack(features)
+# k-distance → pick eps → DBSCAN as usual
+
+Pros: one pass; clusters don’t span far-apart times.
+Cons: you must choose the time weight; still sensitive to regime changes if distributions differ a lot between days.
+
+3) Sliding windows (by time or by count)
+
+If you want intra-day behaviors but still allow slow drift:
+
+Use rolling windows (e.g., last 30 minutes, or last 5,000 events).
+
+Run DBSCAN per window; keep labels with a window ID.
+
+Optional: for each event, take the mode label across overlapping windows to stabilize assignments.
+
+
+Pros: adapts to intraday changes; avoids per-day hard cuts.
+Cons: more plumbing, overlapping labels to reconcile.
+
+
+---
+
+Important details with multi-day data
+
+Interarrival across day boundaries: DON’T let overnight gaps enter your feature. Compute diffs within day (or within your chosen window). Else k-distance knees get flattened.
+
+Scaling leakage: If you scale across all days, heavy-volume days dominate the scaler. Prefer per-day (or per-window) scaling, or at least scale within session types (e.g., RTH vs. overnight).
+
+orderId usage: Still a key, not a feature. Use it to aggregate or to interpret clusters (counts, parent split patterns).
+
+Comparing clusters across days: After per-day DBSCAN, compute per-cluster centroids in the original, unscaled space (easier to interpret), then match clusters across days by nearest centroid or by signature metrics (mean qty, share of buys, mean interarrival, etc.).
+
+
+# Example: per-day cluster summary for cross-day comparison
+summary = (df_labels[df_labels.cluster!=-1]
+    .groupby(['day','cluster'])
+    .agg(n=('cluster','size'),
+         mean_qty=('qty','mean'),
+         mean_dt=('ts', lambda s: s.diff().dropna().mean()),
+         buy_ratio=('side', lambda s: (s.str.upper()=='BUY').mean()))
+    .reset_index()
+)
+
+
+---
+
+Noise handling across many days
+
+Same logic as before:
+
+Keep noise (label == -1) for diagnostics, or drop it.
+
+If one day is very noisy, increase eps or decrease min_samples for that day only.
+
+If you must produce labels for everything, do a nearest-centroid reassignment per day (don’t mix days when reassigning).
+
+
+
+---
+
+When to consider alternatives
+
+HDBSCAN copes better with variable density (common across days/times) and gives soft membership probabilities.
+
+OPTICS lets you extract clusters at multiple density levels without committing to a single eps.
+
+
+
+---
+
+If you tell me whether you care about day-specific structure or global time-aware clusters, I can sketch the exact pipeline (including how to choose w_time and demonstrate a knee pick) in code tailored to your columns.
+
+Easiest way (pandas):
+
+import pandas as pd
+
+# If ts is UNIX seconds (float/int):
+df['ts_dt'] = pd.to_datetime(df['ts'], unit='s', utc=True) \
+                 .dt.tz_convert('Europe/London')            # optional but nice for trading days
+df['day'] = df['ts_dt'].dt.date
+
+Now you can split/loop per day:
+
+# 1) Dict of per-day DataFrames
+by_day = {d: g.copy() for d, g in df.groupby('day', sort=True)}
+
+# 2) Iterate and run your pipeline (e.g., per-day interarrival + DBSCAN)
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import RobustScaler
+import numpy as np
+
+out = []
+for d, g in df.groupby('day', sort=True):
+    g = g.sort_values('ts_dt').copy()
+    g['interarrival_s'] = g['ts_dt'].diff().dt.total_seconds().fillna(0).clip(lower=0)
+    side = (g['side'].str.upper()=='BUY').astype(float).replace({0:-1, 1:1})
+    X = RobustScaler().fit_transform(
+        np.column_stack([np.log1p(g['interarrival_s']), np.log1p(g['qty']), side])
+    )
+    labels = DBSCAN(eps=0.7, min_samples=10).fit_predict(X)   # pick your eps per day
+    g['cluster'] = labels
+    out.append(g)
+
+df_labeled = pd.concat(out, ignore_index=True)
+
+Notes:
+
+If your timestamps are already timezone-aware, skip the tz_convert; if they’re naïve local times, do tz_localize('Europe/London') first.
+
+Computing interarrival_s within each day avoids overnight gaps blowing up the scale.
+
+
+If your epoch is in nanoseconds instead:
+
+df['ts_dt'] = pd.to_datetime(df['ts'], unit='ns', utc=True).dt.tz_convert('Europe/London')
+df['day'] = df['ts_dt'].dt.date
+
+Tiny one-liners you might like:
+
+# quick per-day list of DataFrames
+dfs = [g for _, g in df.sort_values('ts_dt').groupby('day')]
+
+# or get just one day
+d = pd.to_datetime('2025-09-30').date()
+df_one = df[df['day'] == d].copy()
+
+If you’re doing this in q as well:
+
+/ assume t has a timestamp column ts
+update day: date ts from `t
+/ per-day tables in a list:
+tabs: {select from t where day=x} each distinct t[`day]
+
+That’s it—add a day column from your timestamp, then groupby('day') and run DBSCAN in that loop.
+
