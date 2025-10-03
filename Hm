@@ -1,0 +1,161 @@
+Perfect—two quick adjustments:
+
+0) What to do with orderId and seconds interarrival
+
+orderId is a key, not a feature. Don’t feed it to DBSCAN. Use it to group rows or to roll up child orders → parent-order features.
+
+Your interarrival is already in seconds, so you can skip the ns→s conversion. Still consider log1p and scaling.
+
+
+You can go two ways:
+
+
+---
+
+A) Event-level clustering (each row = one child fill/event)
+
+You’ll cluster the stream of events but keep orderId so you can interpret clusters after the fact.
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
+
+# df has: ts (seconds, monotonic), qty, side ('BUY'/'SELL'), orderId
+df = df.sort_values('ts').copy()
+
+# if you want interarrival *between consecutive events overall*:
+df['interarrival_s'] = df['ts'].diff().fillna(0)
+
+# (optional) if you prefer interarrival *within each orderId thread* instead:
+# df['interarrival_s'] = df.groupby('orderId')['ts'].diff().fillna(0)
+
+side_num = np.where(df['side'].str.upper().eq('BUY'), 1.0, -1.0)
+
+X_raw = np.column_stack([
+    np.log1p(df['interarrival_s'].to_numpy()),  # col 0
+    np.log1p(df['qty'].to_numpy()),             # col 1
+    side_num                                    # col 2
+])
+
+scaler = RobustScaler()
+X = scaler.fit_transform(X_raw)
+
+# k-distance plot to pick eps
+min_samples = 10  # try 6–20 depending on noise
+k = min_samples
+nbrs = NearestNeighbors(n_neighbors=k, metric='euclidean').fit(X)
+kdist = np.sort(nbrs.kneighbors(X)[0][:, k-1])
+plt.figure(); plt.plot(kdist)
+plt.xlabel('Points (sorted)'); plt.ylabel(f'Dist to {k}-th NN'); plt.title('k-distance plot')
+plt.show()
+
+eps = 0.7  # pick near the elbow and iterate
+labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(X)
+df['cluster'] = labels  # keep orderId next to cluster
+
+# simple 2D visual on two chosen features:
+i, j = 0, 1  # 0=log interarrival, 1=log qty (by construction above)
+plt.figure()
+for lab in np.unique(labels):
+    mask = labels == lab
+    plt.scatter(X[mask, i], X[mask, j], s=8, alpha=0.7, label=('noise' if lab==-1 else f'c{lab}'))
+plt.xlabel(['log interarrival (scaled)','log qty (scaled)','side (scaled)'][i])
+plt.ylabel(['log interarrival (scaled)','log qty (scaled)','side (scaled)'][j])
+plt.legend(); plt.title('DBSCAN clusters (event-level)'); plt.show()
+
+Reading X[:, 0], X[:, 1]
+
+You built X as [log1p(interarrival_s), log1p(qty), side].
+So:
+
+X[:, 0] = your first feature (log interarrival, scaled)
+
+X[:, 1] = your second feature (log qty, scaled)
+
+X[:, 2] = your third feature (side, scaled)
+
+
+The comma just splits rows selector from columns selector:
+
+: = all rows; 0 = column index 0; 1 = column index 1, etc.
+
+
+
+---
+
+B) Order-level clustering (each row = one parent order)
+
+If each parent has many child fills, cluster parents by aggregating child stats.
+
+g = df.assign(
+    side_num=(df['side'].str.upper()=='BUY').astype(int).replace({0:-1,1:1})
+).sort_values(['orderId','ts']).groupby('orderId', as_index=False)
+
+# per-order features (customise as you like)
+agg = g.agg(
+    parent_qty=('qty','sum'),
+    n_child=('qty','size'),
+    buy_ratio=('side_num', lambda s: (s==1).mean()),
+    # interarrival within order: mean/std of diffs
+    mean_dt=('ts', lambda s: s.diff().dropna().mean() if s.size>1 else 0.0),
+    std_dt=('ts', lambda s: s.diff().dropna().std() if s.size>2 else 0.0),
+)
+
+X_raw = np.column_stack([
+    np.log1p(agg['parent_qty'].to_numpy()),  # col 0
+    np.log1p(agg['n_child'].to_numpy()),     # col 1
+    agg['buy_ratio'].to_numpy(),             # col 2
+    np.log1p(agg['mean_dt'].to_numpy()),     # col 3
+    np.log1p(1e-9 + agg['std_dt'].fillna(0).to_numpy()),  # col 4 (stabilised)
+])
+
+scaler = RobustScaler(); X = scaler.fit_transform(X_raw)
+
+# k-distance → eps → DBSCAN as above
+
+This often gives cleaner clusters (strategies by parent), and you can always drill back down: join the labels on orderId to the child rows.
+
+
+---
+
+Quick heuristics for eps / min_samples
+
+Start with min_samples ≈ 2×features (event-level: 3 feats → ~6–10; order-level: 5 feats → ~10–20).
+
+Use the k-distance elbow for eps, then test ±20–30% around it and pick the one that yields:
+
+a modest number of clusters (not everything noise, not one mega-cluster),
+
+clusters that make trading sense when you tabulate them:
+
+
+
+# sanity table (event-level)
+summary = (
+    df[df.cluster!=-1]
+    .groupby('cluster')
+    .agg(n=('cluster','size'),
+         n_orders=('orderId', 'nunique'),
+         mean_qty=('qty','mean'),
+         mean_dt=('interarrival_s','mean'))
+    .sort_values('n', ascending=False)
+)
+print(summary.head(10))
+
+
+---
+
+Common gotchas (with your setup)
+
+Don’t include orderId as a number in features—it’s just a label.
+
+If interarrival has many zeros (simultaneous prints), log1p(0)=0 is fine, but zero-heavy features can flatten the k-distance elbow. Try adding an event-rate feature (e.g., count of events in last 1s/5s) if that happens.
+
+For plotting, you’re only projecting onto two columns. Make sure you know which by controlling the construction order of X (or label axes explicitly like above).
+
+
+If you paste a few rows (cols: ts in seconds, qty, side, orderId), I’ll show you both the event-level and order-level k-distance elbow and suggest an eps on the spot.
+
