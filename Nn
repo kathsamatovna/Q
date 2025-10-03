@@ -1,0 +1,63 @@
+Perfect — that actually makes your life easier 🙂.
+
+If you already have:
+
+a date column like 2025-09-29 (Python datetime.date or string),
+
+an interarrival_s column (already computed in seconds),
+
+
+then you don’t need to touch timestamps anymore. You can just group directly by your date column.
+
+
+---
+
+Example
+
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import RobustScaler
+
+# Example df
+# df has columns: ['date', 'interarrival_s', 'qty', 'side']
+# date -> daily trading session
+# side -> "BUY"/"SELL"
+
+out = []
+for d, g in df.groupby('date', sort=True):
+    g = g.copy()
+    side_num = np.where(g['side'].str.upper() == 'BUY', 1.0, -1.0)
+
+    # Build feature matrix
+    X_raw = np.column_stack([
+        np.log1p(g['interarrival_s'].to_numpy()),
+        np.log1p(g['qty'].to_numpy()),
+        side_num
+    ])
+    X = RobustScaler().fit_transform(X_raw)
+
+    # Run DBSCAN (choose eps via k-distance elbow per day ideally)
+    labels = DBSCAN(eps=0.7, min_samples=10).fit_predict(X)
+    g['cluster'] = labels
+    out.append(g)
+
+df_labeled = pd.concat(out, ignore_index=True)
+
+
+---
+
+Key points
+
+df.groupby('date') ensures clustering is done separately for each day.
+
+You don’t recompute interarrival_s because you already have it.
+
+If you want to exclude overnight gaps, just make sure interarrival_s was computed within each date originally (not across midnight).
+
+
+
+---
+
+👉 Do you want me to show you how to check overnight gaps aren’t leaking into interarrival_s (e.g., by recomputing per date just in case)?
+
