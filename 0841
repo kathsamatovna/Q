@@ -1,0 +1,164 @@
+Short answer: yes—this use-case is a great fit for ST-DBSCAN (or a carefully weighted DBSCAN/HDBSCAN) as long as you build the feature space sensibly and scale it. Inter-arrival time is useful; “automatic” (algorithmic) flows tend to form distinct, highly regular clusters that you can identify and/or separate with a couple of extra features.
+
+Here’s a compact, battle-tested recipe.
+
+1) Partition & event keys
+
+Cluster within coherent slices to avoid false proximity: by (trader, symbol) first. If you don’t have trader IDs, do at least per-symbol (or per-symbol, side).
+
+If you truly must mix symbols, add symbol embedding/one-hot and give it a large weight so different symbols don’t get glued together. (Often simpler: don’t mix them.)
+
+
+2) Features (temporal + “spatial”)
+
+For each order (sorted by time) compute, per (trader, symbol):
+
+Δt = inter-arrival time in seconds (or ms). Use clip(lower=0) after diff.
+
+qty (or filled_qty): use log1p(qty) to tame tails.
+
+order_size: also log1p(order_size).
+
+side: encode BUY=+1, SELL=−1 (or split runs by side if that fits your question).
+
+Optional but very helpful:
+
+z-score vs local size baseline: size minus a rolling median, divided by rolling MAD (robust z).
+
+time-of-day de-seasonalization: subtract a TOD profile for Δt and size (market open spikes, lunch lulls).
+
+burstiness/regularity (for post-labeling algos): coefficient of variation of Δt within a sliding window, or a simple regularity score (see §6 below).
+
+
+
+3) Scaling (yes, you should)
+
+Because seconds, log-shares, and ±1 side live in different units, normalization is necessary:
+
+Apply RobustScaler (median / IQR) per feature within each (trader, symbol) slice.
+
+Then weight features to implement the “ST” notion:
+
+Pick a temporal window you consider “close”, e.g. W = 0.25 s. After robust scaling, multiply the time column by a factor so that “W” sits roughly near 1–2 σ in the scaled space.
+
+Give symbol/side encodings higher weights only if you’re clustering mixed groups. If you already slice by symbol, set side’s weight modestly (it helps separate meta-orders that ping-pong side).
+
+
+
+Practical example of weights after RobustScaler:
+
+X = [ Δt_scaled * 1.5,  log_qty_scaled * 1.0,  log_order_size_scaled * 0.7,  side * 0.5 ]
+
+Tune those multipliers so clusters look stable across a few dates.
+
+4) ST-DBSCAN vs DBSCAN vs HDBSCAN
+
+ST-DBSCAN (two radii: ε_time, ε_space, plus minPts) is nice if you want explicit “must be close in time and in feature space.” If you don’t have a ready implementation, you can emulate it with DBSCAN by scaling time and non-time features into a single space (as above).
+
+HDBSCAN is often better for irregular densities (HF data usually is), removing the need to pick ε; you still scale/weight features the same way.
+
+OPTICS is also good when densities vary across the day.
+
+
+5) Picking ε (or min_cluster_size)
+
+For DBSCAN, do a k-distance plot (k = min_samples, say 10–30). Look for the elbow in the sorted k-NN distances after scaling. Start with min_samples ≈ 10–20 for busy flows; smaller for sparse users.
+
+For HDBSCAN, pick min_cluster_size as the smallest “run” you care about (e.g., 8–20 orders) and min_samples similar or a bit smaller.
+
+
+6) “But what if it’s an automatic strategy?”
+
+Two points:
+
+1. That’s OK. The goal of clustering is to discover patterns; auto-trading flows typically form tight, regular, often periodic clusters (narrow Δt, similar sizes, consistent side bursts). Human/“intentional” activity tends to be more irregular and mixed.
+
+
+2. If you need to separate them, add quick diagnostics on each cluster:
+
+Regularity score: R = std(Δt)/mean(Δt) (coefficient of variation). Auto flows → small R; discretionary → larger R.
+
+Periodicity check: strong peak in the periodogram / autocorr of timestamps indicates heartbeat-like algos (e.g., 50ms multiples).
+
+Size granularity: many multiples of a base lot (e.g., same 5k, 10k) → algorithmic slicing.
+
+Side persistence: long runs of same side at steady cadence → slicing/meta-order.
+
+Intracluster dispersion: tiny within-cluster variance of (log_qty, log_order_size) + Δt → likely automated.
+
+
+
+
+You can then tag clusters as “likely auto” vs “likely discretionary,” or simply keep both and analyze separately.
+
+7) Minimal Python skeleton (sklearn + robust scaling + DBSCAN)
+
+import numpy as np, pandas as pd
+from sklearn.preprocessing import RobustScaler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+
+def st_dbscan_like(df, eps=None, min_samples=12,
+                   w_time=1.5, w_qty=1.0, w_osize=0.7, w_side=0.5):
+    # assume df has: ts (datetime), side ('BUY'/'SELL'), qty, order_size, symbol
+    df = df.sort_values('ts').copy()
+    df['Δt'] = df['ts'].diff().dt.total_seconds().clip(lower=0).fillna(0)
+    df['log_qty'] = np.log1p(df['qty'])
+    df['log_osize'] = np.log1p(df['order_size'])
+    df['side_num'] = np.where(df['side'].str.upper().eq('BUY'), 1.0, -1.0)
+
+    # scale per symbol to avoid cross-symbol scale leakage (or do this per (trader,symbol))
+    out = []
+    for sym, g in df.groupby('symbol', sort=False):
+        Z = g[['Δt','log_qty','log_osize']].to_numpy()
+        Z = RobustScaler().fit_transform(Z)
+        Z[:,0] *= w_time      # Δt
+        Z[:,1] *= w_qty       # log_qty
+        Z[:,2] *= w_osize     # log_order_size
+        side = (g['side_num'].to_numpy()[:,None]) * w_side
+        X = np.hstack([Z, side])
+
+        # heuristic ε if not provided: 0.9 quantile of k-distances
+        if eps is None:
+            k = min_samples
+            nbrs = NearestNeighbors(n_neighbors=k).fit(X)
+            kdist = np.sort(nbrs.kneighbors(X)[0][:, k-1])
+            eps_use = np.quantile(kdist, 0.9)
+        else:
+            eps_use = eps
+
+        labels = DBSCAN(eps=eps_use, min_samples=min_samples).fit_predict(X)
+        g = g.assign(cluster=labels)
+        out.append(g)
+
+    return pd.concat(out).sort_index()
+
+Swap DBSCAN for HDBSCAN if you have it available (hdbscan.HDBSCAN(min_cluster_size=..., min_samples=...)), which often works better on HF data.
+
+8) Sanity checks & robustness
+
+Downsample/segment by time windows (e.g., 5–15 minutes) and confirm clusters are consistent across adjacent windows.
+
+Stress the weights (±25%) and re-cluster. Stable “stories” (same meta-orders appearing) are what you want.
+
+Evaluate with simple metrics: within-cluster Δt variance, silhouette (if you must), and the “regularity” heuristics above.
+
+Don’t forget market regime: consider adding a rolling volatility proxy (e.g., absolute return of mid or last) and normalize sizes by that, if you have prices.
+
+
+9) When not to use (S)DBSCAN
+
+If the question is “did someone cause a burst?” or “is there a self-exciting pattern?”, clustering may not be the right tool:
+
+Hawkes processes for self-excitation.
+
+Change-point detection for regime shifts in rate/size.
+
+Sessionization (gap-based splitting) + simple summaries when you only need meta-order segmentation.
+
+
+
+---
+
+If you want, I can plug your column names into the skeleton and give you a ready-to-run cell for your dataframe (and a quick “regularity tagger” for the clusters).
+
