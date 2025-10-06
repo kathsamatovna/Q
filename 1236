@@ -1,0 +1,149 @@
+Perfect—raw price and order_qty (no logs). We’ll still RobustScale them (to handle outliers) and you can weight features if one should matter more.
+
+Here’s a clean drop-in using raw qty/price:
+
+import numpy as np, pandas as pd
+from sklearn.preprocessing import RobustScaler
+
+def encode_side(s):
+    s = s.astype(str).str.upper().str.strip()
+    return np.where(s.eq('BUY'), 1.0, np.where(s.eq('SELL'), -1.0, 0.0))
+
+def to_epoch_seconds(series):
+    ts = pd.to_datetime(series, utc=True).dt.tz_convert('UTC').dt.tz_localize(None)
+    return ts.astype('int64') / 1e9  # float seconds
+
+def build_space_block_raw(df, use_qty=True, use_price=True, use_side=True,
+                          w_qty=1.0, w_price=1.0, w_side=0.6):
+    cols = []
+    if use_qty and 'order_qty' in df:
+        x = pd.to_numeric(df['order_qty'], errors='coerce').fillna(0.0).to_numpy()
+        cols.append(x[:, None])
+    if use_price and 'price' in df:
+        p = pd.to_numeric(df['price'], errors='coerce').fillna(0.0).to_numpy()
+        cols.append(p[:, None])
+    if use_side and 'side' in df:
+        cols.append(encode_side(df['side'])[:, None])
+    X_raw = np.hstack(cols) if cols else np.empty((len(df), 0))
+    X = RobustScaler().fit_transform(X_raw) if X_raw.shape[1] else X_raw
+    # apply feature weights
+    if X.shape[1]:
+        weights = np.array([w for w in [w_qty if use_qty else None,
+                                        w_price if use_price else None,
+                                        w_side if use_side else None] if w is not None])
+        X = X * weights
+    return X
+
+def _stdbscan_core(G, eps_feat, eps_time, min_pts):
+    unmarked, outlier = -2, -1
+    cluster_id = 0
+    G = G.copy(); G['cluster'] = unmarked
+
+    t = G['_t_secs'].to_numpy()
+    fcols = [c for c in G.columns if c.startswith('_f')]
+    F = G[fcols].to_numpy()
+    idx = G.index.to_numpy()
+
+    order = np.argsort(t); t, F, idx = t[order], F[order], idx[order]
+    n = len(t); left = 0
+
+    for i in range(n):
+        if G.at[idx[i], 'cluster'] != unmarked: continue
+        while t[i] - t[left] > eps_time: left += 1
+        r = i
+        while r + 1 < n and (t[r+1] - t[i]) <= eps_time: r += 1
+
+        cand = np.arange(left, r+1); cand = cand[cand != i]
+        if cand.size == 0:
+            G.at[idx[i], 'cluster'] = outlier; continue
+        d = np.linalg.norm(F[cand] - F[i], axis=1)
+        nbrs = cand[d <= eps_feat]
+
+        if nbrs.size < (min_pts - 1):
+            G.at[idx[i], 'cluster'] = outlier; continue
+
+        cluster_id += 1
+        G.at[idx[i], 'cluster'] = cluster_id
+        stack = list(nbrs)
+        for j in stack:
+            if G.at[idx[j], 'cluster'] in (unmarked, outlier):
+                G.at[idx[j], 'cluster'] = cluster_id
+
+        k = 0
+        while k < len(stack):
+            p = stack[k]; k += 1
+            left_p = left
+            while t[p] - t[left_p] > eps_time: left_p += 1
+            r_p = p
+            while r_p + 1 < n and (t[r_p+1] - t[p]) <= eps_time: r_p += 1
+
+            candp = np.arange(left_p, r_p+1); candp = candp[candp != p]
+            if candp.size == 0: continue
+            d2 = np.linalg.norm(F[candp] - F[p], axis=1)
+            nbrp = candp[d2 <= eps_feat]
+            if nbrp.size >= (min_pts - 1):
+                for q in nbrp:
+                    if G.at[idx[q], 'cluster'] in (unmarked, outlier):
+                        G.at[idx[q], 'cluster'] = cluster_id
+                        stack.append(q)
+    return G
+
+def st_dbscan_intentional_bursts_raw(df,
+    time_col='startTime',
+    group_by=('symbol',),         # set to () if no symbol
+    eps_time=300.0,               # 5 min window (seconds)
+    eps_feat=1.0,                 # feature radius after RobustScaler (+ weights)
+    min_pts=10,
+    use_price=True, use_side=True,
+    w_qty=1.0, w_price=1.0, w_side=0.6):
+    if not isinstance(group_by, (list, tuple)): group_by = (group_by,)
+    groups = [g for g in group_by if g and g in df.columns]
+    df2 = df.copy().sort_values(time_col)
+    df2['interarrival_s'] = pd.to_datetime(df2[time_col], utc=True)\
+                                .diff().dt.total_seconds().clip(lower=0).fillna(0)
+
+    out = []
+    it = df2.groupby(groups, sort=False) if groups else [(None, df2)]
+    for _, g in it:
+        if len(g) == 0: continue
+        t_secs = to_epoch_seconds(g[time_col]).to_numpy()
+        X_space = build_space_block_raw(g, use_qty=True, use_price=use_price, use_side=use_side,
+                                        w_qty=w_qty, w_price=w_price, w_side=w_side)
+        GG = g.copy()
+        GG['_t_secs'] = t_secs
+        for j in range(X_space.shape[1]):
+            GG[f'_f{j}'] = X_space[:, j]
+        GG = _stdbscan_core(GG, eps_feat=eps_feat, eps_time=eps_time, min_pts=min_pts)
+        out.append(GG)
+
+    res = pd.concat(out).sort_index() if out else df2
+    drop_cols = [c for c in res.columns if c.startswith('_f') or c == '_t_secs']
+    return res.drop(columns=drop_cols, errors='ignore')
+
+Example call (your settings)
+
+labeled = st_dbscan_intentional_bursts_raw(
+    df,
+    time_col='startTime',
+    group_by=('symbol',) if 'symbol' in df.columns else (),
+    eps_time=300.0,     # 5 minutes
+    eps_feat=1.0,       # try 0.8–1.5
+    min_pts=10,
+    use_price=True,     # include raw price
+    use_side=True,      # include BUY/SELL (+1/-1)
+    w_qty=1.0,          # tweak these weights if needed
+    w_price=0.8,        # e.g., make price slightly less dominant
+    w_side=0.6
+)
+
+labeled[['startTime','side','order_qty'] + (['price'] if 'price' in labeled else []) + ['interarrival_s','cluster']].head()
+
+Tips
+
+Keeping raw qty/price is fine; RobustScaler centers by median and scales by IQR, so eps_feat keeps a consistent meaning.
+
+If price dwarfs qty (or vice-versa), adjust w_price / w_qty to balance influence without logs.
+
+Your “intentional bursts within ~5 min” is enforced by eps_time=300; clusters will require both temporal proximity and feature similarity.
+
+
