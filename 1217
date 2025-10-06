@@ -1,0 +1,280 @@
+Perfect—here’s a drop-in rewrite of that notebook to make it a true ST-DBSCAN for HF orders (time + feature space), not lat/long. It:
+
+keeps your function names/structure (so the flow feels familiar),
+
+converts your startTime datetimes to seconds (no scaling on time),
+
+robust-scales only the “spatial” (feature) block (qty/size/side),
+
+clusters per symbol by default (so unrelated symbols don’t glue together),
+
+fixes several bugs in the original (stack usage, wrong index writes, etc.).
+
+
+You can paste these cells straight into your notebook (replace the corresponding ones).
+
+
+---
+
+0) Imports
+
+# Import the necessary libraries
+import math
+from datetime import timedelta
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import RobustScaler
+
+
+---
+
+1) Helpers: side encoding, time handling, feature scaling
+
+# Encode BUY/SELL to +1/-1
+def encode_side(s):
+    s = s.astype(str).str.upper().str.strip()
+    return np.where(s.eq('BUY'), 1.0, np.where(s.eq('SELL'), -1.0, 0.0))
+
+# Convert datetime to float seconds since epoch (works for tz-aware or naive)
+def to_epoch_seconds(series):
+    ts = pd.to_datetime(series, utc=True).dt.tz_convert('UTC').dt.tz_localize(None)
+    return ts.view('int64') / 1e9  # or ts.astype('int64') / 1e9 if view warns
+
+# Build a robust-scaled "spatial" feature matrix (anything that's NOT time)
+def make_space_features(df, log_cols=('order_amount','order_size'), side_col='side'):
+    parts = []
+    for c in log_cols:
+        x = pd.to_numeric(df[c], errors='coerce').fillna(0.0).to_numpy()
+        parts.append(np.log1p(x))
+    if side_col in df.columns:
+        parts.append(encode_side(df[side_col]))
+    X_raw = np.column_stack(parts) if parts else np.empty((len(df), 0))
+    X = RobustScaler().fit_transform(X_raw) if X_raw.shape[1] else X_raw
+    return X  # shape: (n, d_space)
+
+
+---
+
+2) ST-DBSCAN (HF orders): main algorithm
+
+# The ST-DBSCAN algorithm adapted for HF orders:
+# eps1: spatial/feature radius IN THE SCALED FEATURE SPACE (e.g., 0.8–1.5)
+# eps2: temporal radius IN SECONDS (e.g., 0.05–0.50 for HF bursts)
+# min_pts: minimum neighbors (incl. core) to form a cluster (e.g., 8–20)
+
+def ST_DBSCAN_orders(df, eps1, eps2, min_pts,
+                     time_col='startTime',
+                     log_cols=('order_amount','order_size'),
+                     side_col='side',
+                     group_by=('symbol',)):
+    """
+    Returns a copy of df with a 'cluster' column.
+    Clustering is performed per group (default: per symbol).
+    """
+    if not isinstance(group_by, (list, tuple)):
+        group_by = (group_by,)
+
+    out = []
+    for _, g in df.sort_values(time_col).groupby(list(group_by), sort=False):
+        if len(g) == 0:
+            continue
+
+        # Precompute time seconds and scaled feature space
+        t_secs = to_epoch_seconds(g[time_col]).to_numpy()
+        X_space = make_space_features(g, log_cols=log_cols, side_col=side_col)
+        # store together for convenience
+        GG = g.copy()
+        GG['_t_secs'] = t_secs
+        for j in range(X_space.shape[1]):
+            GG[f'_f{j}'] = X_space[:, j]
+
+        # Run ST-DBSCAN on this group
+        GG = _stdbscan_core(GG, eps1, eps2, min_pts)
+
+        out.append(GG)
+
+    res = pd.concat(out).drop(columns=[c for c in res_like(res=out[0]) if c.startswith('_')], errors='ignore') \
+          if out else df.copy().assign(cluster=pd.Series(dtype=int))
+    return res
+
+def res_like(res):
+    return list(res.columns)
+
+
+---
+
+3) Core routine + neighbor search (time window + feature radius)
+
+# Core ST-DBSCAN over a single grouped slice (already has _t_secs and _f* columns)
+
+def _stdbscan_core(G, eps1, eps2, min_pts):
+    unmarked = -2
+    outlier  = -1
+    cluster_id = 0
+
+    # Prepare columns
+    G = G.copy()
+    G['cluster'] = unmarked
+
+    # Convenience arrays
+    t = G['_t_secs'].to_numpy()
+    feat_cols = [c for c in G.columns if c.startswith('_f')]
+    F = G[feat_cols].to_numpy()  # scaled feature space
+    idx = G.index.to_numpy()
+
+    # Iterate in time order to make the temporal windowing cheap-ish
+    order = np.argsort(t)
+    t = t[order]
+    F = F[order]
+    idx = idx[order]
+
+    # For a simple temporal window, use two pointers
+    left = 0
+    n = len(t)
+    # To avoid recomputing neighbors from scratch, we’ll slide a window per point
+    # and then check feature distances within that window.
+
+    for i in range(n):
+        if G.at[idx[i], 'cluster'] != unmarked:
+            continue
+
+        # Advance left bound so that t[i] - t[left] <= eps2
+        while t[i] - t[left] > eps2:
+            left += 1
+        # Right bound: move r while t[r] - t[i] <= eps2
+        r = i
+        while r + 1 < n and (t[r+1] - t[i]) <= eps2:
+            r += 1
+
+        # Candidate neighbors in time window [left, r] excluding i
+        cand_slice = slice(left, r+1)
+        cand_idxs = np.arange(left, r+1)
+        cand_idxs = cand_idxs[cand_idxs != i]
+        if cand_idxs.size == 0:
+            # no temporal neighbors
+            G.at[idx[i], 'cluster'] = outlier
+            continue
+
+        # Feature-space distances to candidates
+        dists = np.linalg.norm(F[cand_idxs] - F[i], axis=1)
+        neigh_mask = dists <= eps1
+        neighbors = cand_idxs[neigh_mask]
+
+        if neighbors.size < (min_pts - 1):  # minus one because i itself is the core
+            G.at[idx[i], 'cluster'] = outlier
+            continue
+
+        # We have a new cluster; expand
+        cluster_id += 1
+        G.at[idx[i], 'cluster'] = cluster_id
+
+        stack = list(neighbors)
+        for j in stack:
+            if G.at[idx[j], 'cluster'] in (unmarked, outlier):
+                G.at[idx[j], 'cluster'] = cluster_id
+
+        # Classic DBSCAN expansion
+        k = 0
+        while k < len(stack):
+            p = stack[k]
+            k += 1
+
+            # Recompute temporal window around p
+            # Move left_p so that t[p] - t[left_p] <= eps2
+            left_p = left
+            while t[p] - t[left_p] > eps2:
+                left_p += 1
+            # Right bound for p
+            r_p = p
+            while r_p + 1 < n and (t[r_p+1] - t[p]) <= eps2:
+                r_p += 1
+
+            cand_p = np.arange(left_p, r_p+1)
+            cand_p = cand_p[cand_p != p]
+            if cand_p.size == 0:
+                continue
+
+            d2 = np.linalg.norm(F[cand_p] - F[p], axis=1)
+            neigh_p = cand_p[d2 <= eps1]
+
+            if neigh_p.size >= (min_pts - 1):
+                for q in neigh_p:
+                    if G.at[idx[q], 'cluster'] in (unmarked, outlier):
+                        G.at[idx[q], 'cluster'] = cluster_id
+                        stack.append(q)
+
+    return G
+
+
+---
+
+4) Plotting (quick sanity view)
+
+# Simple plot: time vs log(order_size) colored by cluster, per symbol
+def plot_clusters(df, time_col='startTime', symbol_col='symbol', size_col='order_size'):
+    for sym, g in df.groupby(symbol_col):
+        labels = g['cluster'].to_numpy()
+        unique = np.unique(labels)
+        plt.figure(figsize=(8, 4))
+        X = pd.to_datetime(g[time_col], utc=True)
+        y = np.log1p(pd.to_numeric(g[size_col], errors='coerce').fillna(0.0))
+        for k in unique:
+            mask = labels == k
+            col = 'k' if k == -1 else None  # black for noise, default cycle for clusters
+            plt.scatter(X[mask], y[mask], s=12, label=f'cluster {k}', c=col)
+        plt.title(f'{sym} — clusters (y = log1p({size_col}))')
+        plt.xlabel('time')
+        plt.ylabel(f'log1p({size_col})')
+        plt.legend(loc='best', fontsize=8)
+        plt.tight_layout()
+        plt.show()
+
+
+---
+
+5) Main cell (example usage)
+
+# Main: read your HF orders and run ST-DBSCAN
+# Expected columns: startTime (datetime), symbol, side, order_amount, order_size
+# Adjust names below if yours differ.
+
+data = pd.read_csv("sample.csv")  # or your real dataframe
+# If your dates are strings: data['startTime'] = pd.to_datetime(data['startTime'], utc=True)
+
+# Parameters:
+eps_feat = 1.2      # feature radius after RobustScaler (try 0.8–1.5)
+eps_time = 0.25     # seconds for temporal neighborhood (try 0.05–0.50)
+min_pts  = 12       # minimum points per cluster (incl. core)
+
+labeled = ST_DBSCAN_orders(
+    data,
+    eps1=eps_feat,
+    eps2=eps_time,
+    min_pts=min_pts,
+    time_col='startTime',
+    log_cols=('order_amount','order_size'),
+    side_col='side',
+    group_by=('symbol',)   # or ('trader_id','symbol') if available
+)
+
+print(labeled[['startTime','symbol','side','order_amount','order_size','cluster']].head())
+plot_clusters(labeled, time_col='startTime', symbol_col='symbol', size_col='order_size')
+
+
+---
+
+Notes (why these changes)
+
+No lat/long: your “space” is order attributes (qty/size/side). We robust-scale them so eps1 has a stable meaning across heavy-tailed data.
+
+Time is raw numeric seconds and compared directly to eps2—no standardization needed.
+
+Per-symbol grouping prevents unrelated symbols from merging. If you have trader IDs, switch to ('trader_id','symbol').
+
+Bug fixes from the original: correct neighbor labeling (for i in neighbors: …), proper stack handling (while stack:), and no accidental writes to wrong indices.
+
+
+If you want, I can also add a tiny grid search cell that sweeps (eps_feat, eps_time, min_pts) per symbol and reports cluster counts + Δt regularity to help you tune quickly.
+
