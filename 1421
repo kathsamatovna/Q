@@ -1,0 +1,145 @@
+Great—let’s surgically swap the geo distance for a feature-space distance over raw order_qty, price, and side, and make the time filter use your startTime with a window in seconds.
+
+Below are the minimal patches you can drop into that notebook.
+
+
+---
+
+0) One-time feature prep (add scaled columns)
+
+Do this once before calling ST_DBSCAN(...). It creates f_qty, f_price, f_side you’ll use inside neighbors.
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+
+def encode_side(s):
+    s = s.astype(str).str.upper().str.strip()
+    return np.where(s.eq('BUY'), 1.0, np.where(s.eq('SELL'), -1.0, 0.0))
+
+def add_feature_space(df,
+                      qty_col='order_qty',
+                      price_col='price',
+                      side_col='side',
+                      w_qty=1.0, w_price=1.0, w_side=0.6):
+    """Create robust-scaled feature-space columns for ST-DBSCAN."""
+    z = []
+    z.append(pd.to_numeric(df[qty_col],  errors='coerce').fillna(0.0).to_numpy())
+    z.append(pd.to_numeric(df[price_col], errors='coerce').fillna(0.0).to_numpy())
+    z.append(encode_side(df[side_col]) if side_col in df else np.zeros(len(df)))
+    X_raw = np.column_stack(z)
+
+    X = RobustScaler().fit_transform(X_raw)         # scale raw qty/price/side (no logs)
+    X[:,0] *= w_qty;  X[:,1] *= w_price;  X[:,2] *= w_side  # optional weights
+
+    out = df.copy()
+    out['f_qty']   = X[:,0]
+    out['f_price'] = X[:,1]
+    out['f_side']  = X[:,2]
+    return out
+
+Call it right after you load your data:
+
+data = pd.read_csv("sample.csv")
+data['startTime'] = pd.to_datetime(data['startTime'], utc=True)   # ensure datetime
+data = add_feature_space(data, qty_col='order_qty', price_col='price', side_col='side',
+                         w_qty=1.0, w_price=0.8, w_side=0.6)
+
+
+---
+
+1) Replace the distance function
+
+Throw away the Haversine dist_calc(...). You won’t need it.
+Distance is simple Euclidean in the scaled feature space:
+
+def feature_distance(center, row):
+    # Euclidean over (f_qty, f_price, f_side)
+    dq = row['f_qty']   - center['f_qty']
+    dp = row['f_price'] - center['f_price']
+    ds = row['f_side']  - center['f_side']
+    return (dq*dq + dp*dp + ds*ds) ** 0.5
+
+Vectorized (faster), we won’t even need a loop (used in the neighbors below).
+
+
+---
+
+2) Fix the neighbors function (time filter + feature radius)
+
+This replaces the lat/long/time logic. Two knobs:
+
+eps2 = temporal window in seconds
+
+eps1 = feature-space radius in the scaled space
+
+
+def neighbors(df, obj, eps1, eps2,
+              time_col='startTime'):
+    """
+    Return indices of neighbors of row `obj` that are:
+      (a) within eps2 seconds in time, AND
+      (b) within eps1 in feature space (f_qty, f_price, f_side).
+    """
+    center = df.loc[obj]
+
+    # 1) Temporal window around the center point
+    t0 = center[time_col]
+    min_time = t0 - pd.Timedelta(seconds=eps2)   # use minutes=eps2 if you prefer minute units
+    max_time = t0 + pd.Timedelta(seconds=eps2)
+    cand = df[(df[time_col] >= min_time) & (df[time_col] <= max_time)]
+
+    # 2) Vectorized feature distance in scaled space
+    dq = cand['f_qty'].to_numpy()   - center['f_qty']
+    dp = cand['f_price'].to_numpy() - center['f_price']
+    ds = cand['f_side'].to_numpy()  - center['f_side']
+    dist = np.sqrt(dq*dq + dp*dp + ds*ds)
+
+    # 3) Indices within feature radius, excluding self
+    mask = (dist <= eps1) & (cand.index.values != obj)
+    return list(cand.index.values[mask])
+
+> Explanation:
+• The time filter narrows candidates to those with timestamps within ±eps2 seconds of the center (pd.Timedelta(seconds=eps2)).
+• The feature distance is Euclidean over your raw qty, raw price, and side, but after RobustScaler (so the numeric units are comparable). eps1 is measured in those scaled units.
+
+
+
+If, instead, you want to keep eps2 in minutes to match the original notebook, just change the two Timedelta(seconds=eps2) to Timedelta(minutes=eps2) and remember to pass minutes in.
+
+
+---
+
+3) (Optional) two tiny fixes in their main loop
+
+Not asked, but they’re common gotchas in that notebook:
+
+# inside ST_DBSCAN(...):
+
+# a) when seeding a new cluster, they iterate 'for i in range(len(x)):' (bug).
+#    Use neighbor indices directly:
+for i in x:
+    df.at[i, 'cluster'] = cluster
+    stack.append(i)
+
+# b) their 'while not stack.IsEmpty():' should be Pythonic:
+while stack:
+    CurrentObj = stack.pop()
+    ...
+
+
+---
+
+4) How to set the thresholds for your case
+
+eps2 (time): you said “intentional bursts within ~5 minutes” → start with eps2 = 5*60 = 300 seconds.
+
+eps1 (feature): because qty/price/side are robust-scaled, start around 1.0.
+If clusters split too much → raise to 1.2–1.5; if they smear → lower to 0.7–0.9.
+
+
+
+---
+
+That’s it. With these swaps, your ST-DBSCAN will (1) window by time around each point, then (2) keep only orders similar in qty/price/side under a single, interpretable radius.
+
