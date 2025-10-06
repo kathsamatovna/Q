@@ -1,0 +1,107 @@
+Totally fine—you don’t scale the raw datetime itself. For ST-DBSCAN you (a) turn time into seconds and (b) scale the other features; then either use a true ST-DBSCAN (two radii) or emulate it with vanilla DBSCAN by weighting time vs features.
+
+Here’s a drop-in pattern that solves your two issues:
+
+What to do with your datetime
+
+Keep it as datetime64[ns] (tz-aware is OK).
+
+Create epoch seconds (or just use the original timestamp in seconds) — you are not standardizing the timestamp; you’re converting its unit.
+
+If you were getting “can’t cast to float64”, it’s usually because the series is tz-aware; fix with dt.tz_convert('UTC').dt.tz_localize(None) before casting.
+
+
+# ts can be tz-aware or naive; we normalize to naive UTC first
+ts = pd.to_datetime(df['startTime'], utc=True).dt.tz_convert('UTC').dt.tz_localize(None)
+
+# absolute time in seconds (epoch). This is numeric and works in sklearn.
+t_secs = ts.view('int64') / 1e9           # pandas >= 1.0; gives float seconds
+# If pandas warns about .view, you can use: t_secs = ts.astype('int64') / 1e9
+
+# Optionally also keep inter-arrival for diagnostics (not used directly by DBSCAN distance):
+df['dt_s'] = ts.diff().dt.total_seconds().clip(lower=0).fillna(0)
+
+Scale the non-time features (yes, you should)
+
+Use robust scaling on heavy-tailed stuff; don’t scale the time column together with the rest.
+
+from sklearn.preprocessing import RobustScaler
+import numpy as np
+
+# Build your "spatial" feature block (anything that isn’t time)
+X_raw = np.column_stack([
+    np.log1p(df['order_amount'].to_numpy()),   # or qty
+    np.log1p(df['order_size'].to_numpy()),
+    np.where(df['side'].str.upper().eq('BUY'), 1.0, -1.0)
+])
+X_feat = RobustScaler().fit_transform(X_raw)
+
+Emulate ST-DBSCAN with DBSCAN (simple and reliable)
+
+Pick two intuitive thresholds:
+
+eps_time = how close in time two orders must be (e.g., 0.2 seconds)
+
+eps_feat = how close in feature space they must be after scaling (e.g., 1.2 in z-space)
+
+
+Then weight the columns so that “distance = 1” means “just at the limit” in either dimension. Run DBSCAN with eps=1.0.
+
+from sklearn.cluster import DBSCAN
+import pandas as pd
+
+def run_stdbscan_emulated(df,
+                          eps_time=0.2,       # seconds
+                          eps_feat=1.2,       # euclidean radius in scaled feature space
+                          min_samples=12):
+    # 1) time -> seconds (numeric)
+    ts = pd.to_datetime(df['startTime'], utc=True).dt.tz_convert('UTC').dt.tz_localize(None)
+    t_secs = ts.view('int64') / 1e9
+
+    # 2) features -> robust-scaled
+    X_raw = np.column_stack([
+        np.log1p(df['order_amount'].to_numpy()),
+        np.log1p(df['order_size'].to_numpy()),
+        np.where(df['side'].str.upper().eq('BUY'), 1.0, -1.0)
+    ])
+    X_feat = RobustScaler().fit_transform(X_raw)
+
+    # 3) weights so that: |Δt| = eps_time  -> contributes 1.0 to the distance
+    #                      ||Δfeat|| = eps_feat -> contributes 1.0 to the distance
+    w_t   = 1.0 / eps_time
+    w_feat = 1.0 / eps_feat
+
+    # time goes in as its own column; features are scaled as a block
+    X = np.column_stack([ (t_secs - t_secs.min()) * w_t,   # subtract min to keep magnitudes tidy
+                          X_feat * w_feat ])
+
+    # 4) vanilla DBSCAN with eps=1.0 now enforces BOTH constraints jointly (ST-like)
+    labels = DBSCAN(eps=1.0, min_samples=min_samples).fit_predict(X)
+
+    out = df.copy()
+    out['cluster'] = labels
+    return out
+
+Why this works
+
+By putting time and features on comparable scales (w_t = 1/eps_time, w_feat = 1/eps_feat) and using eps=1.0, two points are neighbors iff their time gap is within eps_time and their feature distance is within eps_feat (approximately; with Euclidean, large violation in one dimension can dominate—if you want a strict “both must be within threshold” rule, switch to Chebyshev metric over [t_scaled, ||feat_scaled||] or use a tiny trick below).
+
+Strict both-threshold variant (no leakage): Compute two columns only: t_scaled = |Δt|/eps_time and f_scaled = ||Δfeat||/eps_feat via a custom metric or precomputed distance; then use DBSCAN with Chebyshev distance and eps=1.0. That enforces max(t_scaled, f_scaled) ≤ 1.
+
+If you want a true ST-DBSCAN (two eps values)
+
+You can implement it efficiently with a sliding time window: for each point, restrict candidates to those within eps_time (via a deque / index window), then test the feature-space distance ≤ eps_feat. The emulation above is usually sufficient and much faster to get running.
+
+About inter-arrival time & “automatic” trades
+
+Keep dt_s for diagnostics, not as a clustering dimension (it’s not pairwise). After you get clusters, tag them:
+
+regularity: std(dt_s)/mean(dt_s) small → likely automated slicing
+
+lot granularity: many exact repeats of size → automated
+
+side persistence: long same-side runs → meta-order
+
+
+If you need the code for the strict Chebyshev variant or a sliding-window ST-DBSCAN, say the word and I’ll hand you a ready-to-run function.
+
