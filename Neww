@@ -1,0 +1,384 @@
+Nice — this is a great question and totally fixable. I’ll (A) explain what your notebook’s ST-DBSCAN/feature code is doing, line-by-line in simple terms, and then (B) give a corrected, ready-to-copy implementation + plotting fixes + tuning tips so you actually detect trade clusters across the day.
+
+I’ll paraphrase the code blocks you have in the notebook and explain each line as if you’re new to this (no judgement). Then I’ll give the fixed code and explain the important changes.
+
+
+---
+
+A — what the notebook code is doing (plain English, line-by-line)
+
+add_feature_space(df_day, qty_col, price_col, side_col, w_qty=1.0, w_price=1.0, w_side=1.0)
+
+Goal: create scaled features used for spatial distance (qty, price, side).
+
+z = []
+make an empty list to accumulate numeric arrays.
+
+z.append(pd.to_numeric(df_day[qty_col], errors='coerce').fillna(0.0).to_numpy())
+convert quantity column to numbers; invalid → NaN → replaced by 0.0; convert to NumPy array. This is the raw qty axis.
+
+z.append(pd.to_numeric(df_day[price_col], errors='coerce').fillna(0.0).to_numpy())
+same for price.
+
+z.append(encode_side(df_day[side_col]) if side_col in df_day else np.zeros(len(df_day)))
+map BUY/SELL to (+1/-1 or similar). If side not present, use zeros.
+
+X_raw = np.column_stack(z)
+stack the three arrays into an N×3 matrix where rows are trades and columns are [qty, price, side].
+
+X = RobustScaler().fit_transform(X_raw)
+scale the columns so they are robust to outliers (median/IQR scaling). This helps distance combine qty/price/side sensibly.
+
+X[:,0] *= w_qty; X[:,1] *= w_price; X[:,2] *= w_side
+apply optional weights to emphasize one feature more than others.
+
+out = df_day.copy(); out['f_qty'] = X[:,0] ...
+attach the scaled features back to the dataframe (so each row has f_qty, f_price, f_side). Return out.
+
+
+Why to do this: DBSCAN uses Euclidean distance in feature space. If you leave raw price/qty unscaled, one dominates. Scaling plus weights makes the feature metric meaningful.
+
+
+---
+
+neighbors(df_day, obj, eps1, eps2, time_col='startTime')
+
+Goal: find neighbors of a center trade obj using both (a) a temporal window ±eps2 and (b) a spatial radius eps1 in the scaled feature space.
+
+center = df_day.loc[obj]
+get the row (trade) that’s the center — must use .loc with the row index.
+
+t0 = center[time_col]
+the center trade time.
+
+min_time = t0 - pd.Timedelta(minutes=eps2)
+max_time = t0 + pd.Timedelta(minutes=eps2)
+build a time window ±eps2 minutes around the center.
+
+cand = df_day[(df_day[time_col] >= min_time) & (df_day[time_col] <= max_time)]
+restrict candidate neighbors to trades that happened within that time window (very important for speed/temporal locality).
+
+dq = (cand['f_qty'].to_numpy()- center['f_qty'])**2
+dp = (cand['f_price'].to_numpy()- center['f_price'])**2
+dist = np.sqrt(dq + dp + ds*ds)
+compute Euclidean distance in scaled space (qty & price & maybe side). dist is a NumPy array of distances between center and candidates.
+
+mask = (dist <= eps1) & (cand.index.values != obj)
+pick candidates within spatial radius and exclude the center itself.
+
+return list(cand.index.values[mask])
+return the list of index labels (row indices) that are neighbors.
+
+
+Why to do this: ST-DBSCAN requires both a spatial threshold and a temporal window. Good: restricting by time first is efficient.
+
+Pitfalls you might have had:
+
+If center[time_col] isn’t a real datetime64[ns, tz] type, pd.Timedelta(minutes=eps2) comparisons fail or return empty.
+
+If f_price or f_qty are missing or not numeric, dist becomes NaN and mask selects nothing.
+
+
+
+---
+
+ST_DBSCAN(df_day, Eps1, Eps2, min_samples)
+
+Goal: run the spatio-temporal DBSCAN algorithm (the classic DBSCAN expansion adapted to require both temporal and spatial proximity). Rough flow:
+
+Initialize cluster = 0, stack = [], outlier = -1, unmarked = -2.
+cluster numbering, stack for cluster expansion, flags.
+
+df_day['cluster'] = unmarked
+mark all rows as unvisited/unmarked.
+
+Loop for key, value in df_day.iterrows(): — for each row index key:
+
+If df_day.loc[key,'cluster'] != unmarked: continue (already visited).
+
+x = neighbors(df_day, key, Eps1, Eps2) — find neighbors of key.
+
+If len(x) < min_samples: mark df_day.at[key,'cluster'] = outlier.
+else: new core point -> cluster += 1, label core df_day.at[key,'cluster'] = cluster and push neighbors to stack. Then while stack: pop a neighbor, find neighbors of the neighbor and expand cluster (the standard DBSCAN region expansion).
+
+
+Return df_day with cluster column.
+
+
+Common code problems I see in notebooks:
+
+Using chained assignment like df_day['cluster'] = unmarked then later df_day['cluster'][i] = cluster can trigger SettingWithCopy warnings and silently fail to modify the real DataFrame. Use .at or .loc to assign by label: df_day.at[idx,'cluster'] = cluster.
+
+Using df_day.iterrows() and then using integer counters can mix up integer positions vs index labels. Use index labels consistently or reindex to integer (0..N-1).
+
+Using a neighbors function that returns boolean mask vs index labels inconsistently across calls.
+
+Performance: iterating row-by-row (O(N²)) — okay for small N (few hundred) but slow for thousands.
+
+
+
+---
+
+plotting error you saw: InvalidIndexError: (slice(None,None,None), 0)
+
+Cause: you wrote st_dbscan[:,0] where st_dbscan is a pandas DataFrame, not a NumPy array. Pandas expects label/index based slicing for df[...]. Use st_dbscan.iloc[:,0] (position-based) or st_dbscan['f_qty']. Also use df['cluster'] when coloring.
+
+
+---
+
+B — fixed, robust implementation + explanation (copy/paste)
+
+This version:
+
+ensures startTime is datetime
+
+builds the feature columns robustly
+
+uses .at for safe assignment
+
+vectors neighbors and returns index list
+
+uses sensible defaults and prints diagnostics
+
+plotting uses .iloc / column names
+
+
+# copy this whole block into a cell and run it
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
+from collections import deque
+import matplotlib.pyplot as plt
+
+def encode_side(srs):
+    # map BUY->1, SELL->-1, missing->0
+    return srs.fillna('').str.upper().map({'BUY': 1.0, 'SELL': -1.0}).fillna(0.0).to_numpy()
+
+def add_feature_space(df_day, qty_col='grossOrdered', price_col='priceExecuted', side_col='orderSide',
+                      w_qty=1.0, w_price=1.0, w_side=1.0):
+    # Ensure numeric arrays (no strings) and fill NaNs
+    qty = pd.to_numeric(df_day[qty_col], errors='coerce').fillna(0.0).to_numpy()
+    price = pd.to_numeric(df_day[price_col], errors='coerce').fillna(0.0).to_numpy()
+    if side_col in df_day:
+        side = encode_side(df_day[side_col])
+    else:
+        side = np.zeros(len(df_day))
+    X_raw = np.column_stack([qty, price, side])
+    scaler = RobustScaler()
+    X = scaler.fit_transform(X_raw)            # shape (N,3)
+    # apply weights
+    X[:,0] *= w_qty
+    X[:,1] *= w_price
+    X[:,2] *= w_side
+    out = df_day.copy()
+    out['f_qty'] = X[:,0]
+    out['f_price'] = X[:,1]
+    out['f_side'] = X[:,2]
+    return out
+
+def neighbors(df_day, obj_idx, eps1, eps2_minutes, time_col='startTime'):
+    """
+    Return a list of index labels (df_day.index values) that are neighbors of obj_idx.
+    eps1 = spatial radius in scaled feature space (same units as f_qty/f_price)
+    eps2_minutes = half-window in minutes (i.e. +/- eps2_minutes)
+    """
+    center = df_day.loc[obj_idx]
+    t0 = center[time_col]
+    if pd.isna(t0):
+        return []      # no time -> no neighbors
+    # build temporal window
+    min_time = t0 - pd.Timedelta(minutes=eps2_minutes)
+    max_time = t0 + pd.Timedelta(minutes=eps2_minutes)
+    cand = df_day[(df_day[time_col] >= min_time) & (df_day[time_col] <= max_time)]
+    if cand.shape[0] == 0:
+        return []
+    # compute vectorized distances (f_qty and f_price are expected numeric)
+    dq = (cand['f_qty'].to_numpy() - center['f_qty'])**2
+    dp = (cand['f_price'].to_numpy() - center['f_price'])**2
+    ds = (cand['f_side'].to_numpy() - center['f_side'])**2 if 'f_side' in cand else 0.0
+    dist = np.sqrt(dq + dp + ds)
+    mask = (dist <= eps1)
+    # exclude the center itself
+    mask &= (cand.index.to_numpy() != obj_idx)
+    # return the list of index labels
+    return list(cand.index.to_numpy()[mask])
+
+def ST_DBSCAN(df_day, eps1, eps2_minutes, min_samples):
+    # copy to avoid side-effects
+    df = df_day.copy()
+    # initialize cluster column with an unmarked flag
+    UNMARKED = -2
+    OUTLIER = -1
+    df['cluster'] = UNMARKED
+    cluster_id = 0
+    # iterate over the DataFrame index (these are the row labels)
+    for idx in df.index:
+        if df.at[idx, 'cluster'] != UNMARKED:
+            continue  # already processed
+        neigh = neighbors(df, idx, eps1, eps2_minutes)
+        if len(neigh) < min_samples:
+            df.at[idx, 'cluster'] = OUTLIER
+            continue
+        # start new cluster
+        cluster_id += 1
+        df.at[idx, 'cluster'] = cluster_id
+        # use deque for BFS-like expansion
+        stack = deque(neigh)
+        while stack:
+            n_idx = stack.popleft()
+            if df.at[n_idx, 'cluster'] == OUTLIER:
+                # previously marked noise -> now becomes part of this cluster
+                df.at[n_idx, 'cluster'] = cluster_id
+            if df.at[n_idx, 'cluster'] != UNMARKED:
+                # already assigned to some cluster -> skip
+                continue
+            # mark as part of current cluster
+            df.at[n_idx, 'cluster'] = cluster_id
+            # retrieve neighbors of neighbor
+            neigh2 = neighbors(df, n_idx, eps1, eps2_minutes)
+            if len(neigh2) >= min_samples:
+                # expand the region: add new neighbors to stack if not already assigned
+                for m in neigh2:
+                    if df.at[m, 'cluster'] == UNMARKED:
+                        stack.append(m)
+    return df
+
+def plot_clusters(df_with_clusters, xcol='f_qty', ycol='f_price', cluster_col='cluster'):
+    plt.figure(figsize=(10,6))
+    clusters = df_with_clusters[cluster_col].values
+    x = df_with_clusters[xcol].values
+    y = df_with_clusters[ycol].values
+    # map cluster ids to colors, noise = -1 will become first color which is OK
+    unique = np.unique(clusters)
+    cmap = plt.get_cmap('tab20')
+    # simple color mapping
+    color_map = {cid: cmap(i % 20) for i, cid in enumerate(unique)}
+    colors = [color_map[c] for c in clusters]
+    plt.scatter(x, y, c=colors, s=25, alpha=0.8, edgecolors='k', linewidth=0.2)
+    plt.xlabel(xcol); plt.ylabel(ycol)
+    plt.title('ST-DBSCAN clustering (cluster id shown by color)')
+    # annotate number of clusters and noise
+    n_clusters = len([c for c in unique if c > 0])
+    n_noise = np.sum(clusters == -1)
+    plt.suptitle(f'clusters={n_clusters} noise={n_noise}')
+    plt.show()
+
+
+---
+
+C — how to use the fixed code on your data (practical step-by-step)
+
+1. Make sure times are real datetimes
+
+
+
+df['startTime'] = pd.to_datetime(df['startTime'], utc=True)   # or tz_localize if needed
+
+If times are strings or ints you must convert first.
+
+2. Add feature space (choose columns that actually exist in your df):
+
+
+
+df = add_feature_space(df, qty_col='f_qty_rawcolname', price_col='f_price_rawcolname', side_col='orderSide', w_qty=1.0, w_price=1.0)
+
+Replace raw column names with what you have (e.g. 'grossOrdered' and 'priceExecuted').
+
+3. Run ST_DBSCAN (these parameters are examples you must tune):
+
+
+
+eps1 = 0.6       # spatial radius in scaled feature space (rough starting point)
+eps2 = 5        # temporal half-window in minutes (so +/- 5 minutes)
+min_samples = 3  # core density threshold
+out = ST_DBSCAN(df, eps1, eps2, min_samples)
+plot_clusters(out)
+
+
+---
+
+D — tips on choosing/tuning parameters & debugging
+
+eps2 (time window): If you expect bursts inside 5 minutes, try eps2 = 5. If microbursts at seconds level, use seconds: adjust neighbors to use pd.Timedelta(seconds=eps2_seconds) if needed.
+
+eps1 (spatial radius): Because features are RobustScaled, eps1 tends to be O(0.1..2). Start with 0.5–1.0 and tweak: bigger => merges clusters; smaller => more noise.
+
+min_samples: 2–5 for trade clustering; higher to require bigger coordinated activity.
+
+Plot f_qty vs f_price colored by cluster — this will show whether clusters make sense in feature space.
+
+Plot time series with cluster labels: plt.scatter(df['startTime'].values, df['f_qty'], c=df['cluster']) — that shows temporal grouping.
+
+
+
+---
+
+E — specific fixes to errors you saw in your screenshots
+
+InvalidIndexError when plotting st_dbscan[:,0]
+Fix: use st_dbscan.iloc[:,0] or st_dbscan['f_qty']. Pandas does not support df[:,0].
+
+SettingWithCopyWarning / cluster assignments not persisting
+Fix: use df.at[idx,'cluster'] = value or df.loc[idx, 'cluster'] = value. Avoid df['cluster'][i] = ....
+
+Neighbors returning empty
+Causes: times not datetime, features NaN, eps1 too small, eps2 too short. Check with:
+
+
+print(df.startTime.dtype, df[['f_qty','f_price']].isna().sum())
+
+Performance: for N a few hundred the algorithm above is fine. For thousands, use spatial index / KDTree on scaled features per temporal window or try scikit-learn DBSCAN on a combined metric (time scaled to same units) or use optimized ST-DBSCAN implementations.
+
+
+
+---
+
+F — sanity checks to run now (quick commands)
+
+Run these to check your data before clustering:
+
+# 1. datetimes ok?
+print(df['startTime'].head(), df['startTime'].dtype)
+
+# 2. any NaNs in scaled features?
+print(df[['f_qty','f_price','f_side']].isna().sum())
+
+# 3. preview neighbors for one center (choose an index label from df.index)
+idx = df.index[0]
+print("neighbors sample:", neighbors(df, idx, eps1=0.7, eps2_minutes=5))
+
+# 4. k-distance elbow (estimate eps1):
+from sklearn.neighbors import NearestNeighbors
+X = df[['f_qty','f_price']].to_numpy()
+nbrs = NearestNeighbors(n_neighbors=4).fit(X)
+distances, indices = nbrs.kneighbors(X)
+kdist = np.sort(distances[:,3])
+import matplotlib.pyplot as plt
+plt.plot(kdist); plt.title('k-distance (k=4)'); plt.show()
+
+
+---
+
+Final notes (practical)
+
+If you want automatic parameter selection, compute the k-distance plot and pick the elbow for eps1. For eps2, pick a temporal scale that matches the business definition of a "burst" (5 min, 1 min, 30s).
+
+If you want very precise bursts at the second/nanosecond level, convert eps2 to seconds and use pd.Timedelta(seconds=...).
+
+If you paste your actual df.head() and the column names you’re using (startTime, grossOrdered, priceExecuted, orderSide?), I’ll adapt the code to your exact names and pick good starting parameters.
+
+
+
+---
+
+If you want, I can:
+
+adapt the code to seconds-based eps2,
+
+show how to run scikit-learn DBSCAN on [time_scaled, f_qty, f_price] instead of ST_DBSCAN,
+
+or help tune eps1/eps2/min_samples interactively if you paste a small sample of the DF.
+
+
+Which of those would help the most?
+
