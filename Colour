@@ -1,0 +1,140 @@
+Short answer: Yes — with two simple plots you’ll clearly see temporal clusters:
+
+1. a scatter in feature space (f_qty vs f_price) coloured by cluster — shows why points were grouped.
+
+
+2. a scatter over time (startTime vs f_qty) coloured by cluster — shows when the clusters happened (vertical groups at the same time mean many orders clustered together).
+
+
+
+Paste-run the two plotting functions below using the DataFrame returned by out = ST_DBSCAN(...) (I’ll assume it’s called out or df_with_clusters).
+
+
+---
+
+Plot A — feature space (qty vs price) coloured by cluster
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_feature_space(df_with_clusters, x='f_qty', y='f_price', cluster_col='cluster'):
+    # Prepare arrays
+    X = df_with_clusters[x].values
+    Y = df_with_clusters[y].values
+    clusters = df_with_clusters[cluster_col].values
+
+    # Unique cluster ids (noise is -1)
+    unique = np.unique(clusters)
+    # Map each cluster id to a color; noise -> grey
+    cmap = plt.get_cmap('tab20')
+    color_map = {}
+    for i, cid in enumerate(unique):
+        if cid == -1:
+            color_map[cid] = (0.7,0.7,0.7,0.9)   # grey for noise
+        else:
+            color_map[cid] = cmap(i % 20)
+    colors = [color_map[c] for c in clusters]
+
+    plt.figure(figsize=(9,6))
+    plt.scatter(X, Y, c=colors, s=36, edgecolor='k', linewidth=0.2, alpha=0.85)
+    plt.xlabel(x); plt.ylabel(y)
+    n_clusters = sum(unique > 0)
+    n_noise = (clusters == -1).sum()
+    plt.title(f'Feature-space clusters — clusters={n_clusters}, noise={n_noise}')
+    plt.grid(alpha=0.2)
+    plt.show()
+
+# usage:
+# plot_feature_space(out)
+
+What you’ll see: clusters that are grouped in the (qty,price) plane. If many points lie close in this plane they’ll share the same colour (cluster id).
+
+
+---
+
+Plot B — time-series view (time vs qty) coloured by cluster — best to detect temporal bursts
+
+import matplotlib.dates as mdates
+
+def plot_time_series_clusters(df_with_clusters, time_col='startTime', ycol='f_qty', cluster_col='cluster'):
+    df = df_with_clusters.sort_values(time_col)
+    times = df[time_col].values
+    y = df[ycol].values
+    clusters = df[cluster_col].values
+
+    unique = np.unique(clusters)
+    cmap = plt.get_cmap('tab20')
+    color_map = {}
+    for i, cid in enumerate(unique):
+        if cid == -1:
+            color_map[cid] = (0.7,0.7,0.7,0.9)
+        else:
+            color_map[cid] = cmap(i % 20)
+    colors = [color_map[c] for c in clusters]
+
+    plt.figure(figsize=(12,4))
+    plt.scatter(times, y, c=colors, s=30, alpha=0.9, edgecolor='none')
+    plt.xlabel('time'); plt.ylabel(ycol)
+    plt.title('Time-series of trades coloured by cluster')
+    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gca().xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+    plt.grid(alpha=0.15)
+    plt.tight_layout()
+    plt.show()
+
+# usage:
+# plot_time_series_clusters(out)
+
+What you’ll see: vertical groupings (many points at similar times) with the same colour = a temporal cluster. Because ST-DBSCAN required a temporal window (eps2) during clustering, points in the same cluster should appear close on the time axis.
+
+
+---
+
+Extra helpful visuals / checks
+
+1. Highlight cluster extents on time axis — show start/end times of each cluster:
+
+
+
+def cluster_time_summary(df_with_clusters, time_col='startTime', cluster_col='cluster'):
+    clusters = [c for c in df_with_clusters[cluster_col].unique() if c > 0]
+    rows = []
+    for c in clusters:
+        sub = df_with_clusters[df_with_clusters[cluster_col] == c]
+        rows.append((c, sub[time_col].min(), sub[time_col].max(), len(sub)))
+    summary = pd.DataFrame(rows, columns=['cluster','start','end','count']).sort_values('start')
+    return summary
+
+# usage:
+# print(cluster_time_summary(out))
+
+2. Zoom into a suspected burst — pick cluster id k and plot only that time window to inspect order sizes/prices:
+
+
+
+k = 3   # example cluster id
+sub = out[out['cluster']==k]
+plot_feature_space(sub)           # feature-space inside that cluster
+plot_time_series_clusters(sub)    # time-series of that cluster
+
+
+---
+
+Practical notes & gotchas
+
+If many points are coloured the same but spread in time, your eps2 (temporal window) was too large — clusters will link distant times. Reduce eps2.
+
+If cluster colours change rapidly in time but you expected a single burst, your eps1 (spatial radius) may be too small — increase eps1.
+
+Noise points are cluster == -1. They’ll be grey in the plots above.
+
+Use plot_time_series_clusters to visually confirm whether clusters are temporal bursts (many same-colour points around the same timestamp).
+
+If points overlap visually at same time & qty, add alpha < 1 or s smaller so density is visible.
+
+
+
+---
+
+If you paste the name of the DataFrame you used (e.g. st_dbscan, out, df_day) I’ll give the exact one-liners to call these plotting functions on your notebook. Also tell me whether you want eps2 in minutes or seconds and I’ll tailor the cluster-time summaries accordingly.
+
