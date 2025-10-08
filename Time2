@@ -1,0 +1,23 @@
+# reset index so you can manipulate
+dfplot = dfnew.reset_index(names=['date','t5'])
+
+# compute time of day in minutes (common x-axis)
+dfplot['slot_min'] = ((pd.to_datetime(dfplot['t5']) - 
+                       pd.to_datetime(dfplot['date'])).dt.total_seconds() / 60)
+
+# pivot so each date is a column, rows = time of day
+wide = dfplot.pivot_table(index='slot_min', columns='date', values='grossOrdered')
+
+# plot with shared x-axis
+axes = wide.plot(subplots=True, sharex=True, figsize=(12, 1.8*wide.shape[1]), legend=False)
+
+for ax in axes:
+    ax.set_xlim(0, 24*60)
+    ax.set_xticks(range(0, 24*60, 60))
+    ax.set_xticklabels([f'{h:02d}:00' for h in range(24)])
+    ax.set_xlabel('Time of day')
+    ax.set_ylabel('grossOrdered')
+
+import matplotlib.pyplot as plt
+plt.tight_layout()
+plt.show()
