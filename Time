@@ -1,0 +1,80 @@
+Got it — you’ve effectively got two levels derived from the same timestamp: a date level and a within-day (5-min) time level. To plot cleanly on a 5-minute grid you have two solid patterns:
+
+
+---
+
+1) One continuous timeline (all dates together)
+
+If you just want a single x-axis in 5-min bins across the whole period:
+
+df = df.copy()
+df['t5'] = df['startdate'].dt.floor('5min')
+
+# pick a value to plot; here I use count per bin
+s = (df
+     .set_index('t5')
+     .assign(val=1)                     # or your metric
+     .resample('5min')['val']
+     .sum()
+     .asfreq('5min', fill_value=0))     # ensure no gaps
+
+ax = s.plot(figsize=(10,4))
+ax.set_title('All dates on one 5-min timeline')
+ax.set_xlabel('Time')
+ax.set_ylabel('Count')
+
+This avoids MultiIndex entirely and guarantees a uniform 5-min axis.
+
+
+---
+
+2) Same time-of-day x-axis for each date (panel view)
+
+If you want each date as its own series (or subplot) but all sharing the same 00:00–24:00 in 5-min x-axis:
+
+df = df.copy()
+df['date'] = df['startdate'].dt.normalize()      # midnight of that day (Timestamp)
+df['t5']   = df['startdate'].dt.floor('5min')
+
+# reduce to per-(date, t5) bins (e.g., count or sum/mean of a metric)
+g = df.groupby(['date','t5']).size().rename('val').reset_index()
+
+# convert to "time since midnight" so every day aligns to the SAME 5-min x-axis
+g['slot'] = g['t5'] - g['date']                  # Timedelta (00:00..23:55)
+
+# make a complete 5-min grid for the day
+grid = pd.timedelta_range('0H', '24H', freq='5min', inclusive='left')
+
+# pivot: rows = 5-min slot, columns = date
+wide = (g.pivot(index='slot', columns='date', values='val')
+          .reindex(grid)
+          .fillna(0))
+
+# EITHER plot all dates on one axes (aligned by time-of-day)
+ax = wide.plot(figsize=(11,6))
+ax.set_title('Each date aligned on the same 5-min time-of-day axis')
+ax.set_xlabel('Time since midnight')
+ax.set_ylabel('Count')
+
+# OR make subplots, still sharing same x (time-of-day)
+axes = wide.plot(subplots=True, sharex=True, figsize=(11,1.8*wide.shape[1]), legend=False)
+
+Why this works
+
+Using slot = t5 - date creates a TimedeltaIndex (00:00, 00:05, …, 23:55) that’s identical for every day, so all columns (dates) align perfectly.
+
+Reindexing to a full pd.timedelta_range(..., freq='5min') ensures missing bins exist (filled with 0 or NaN as you prefer).
+
+
+
+---
+
+Common pitfalls to avoid
+
+Don’t use .dt.date for the daily level if you plan to align with timestamps; use .dt.normalize() (stays Timestamp).
+
+If you keep a MultiIndex of (date, t5) and then do .unstack('date'), make sure the row index is the uniform 5-min grid (like slot above). Otherwise each date will have its own irregular 5-min positions and plotting will “repeat”/misalign.
+
+
+If you paste your current df.index.names and a few sample rows, I can adapt the snippet exactly to your structure (e.g., if you already have df = df.set_index(['date','t5']), I’ll show the minimal unstack path).
+
