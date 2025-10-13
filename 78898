@@ -1,0 +1,272 @@
+Great — venue names and other categorical (non-spatial) features are very useful, but they need careful encoding before you feed them into a spatial distance (ST-DBSCAN) routine. Below I’ll:
+
+1. explain the main options in plain language and pros/cons,
+
+
+2. show two practical implementations you can copy-paste (a) binary same/different (cheap & robust) and (b) one-hot → dimension-reduce (SVD) (scales to many venues), and
+
+
+3. show how to mix categorical distance with numeric distance and tune a weight so the DBSCAN neighbors function respects venue similarity.
+
+
+
+No questions — I’ll give code you can drop into your notebook and short recommendations for which to pick.
+
+
+---
+
+Quick overview (plain English)
+
+Binary same/different: treat venues as either the same (distance 0) or different (distance 1). Very robust; cheap; good when the main question is “same venue or not”.
+
+Frequency / ordinal encoding: replace venue name with its count or rank. Simple, but can be misleading (does count imply similarity?).
+
+One-hot encoding: convert each venue to an indicator vector. Accurate but creates high dimensional sparse vectors (makes Euclidean distances weird).
+
+One-hot → SVD / PCA (dense embedding): take the sparse one-hot matrix, compress it to a small dense vector per venue. Keeps relative structure and is good for many venues.
+
+Target / mean encoding (e.g. mean slippage per venue): replace venues with the average of a target variable. Powerful but leaks if used incorrectly — only use with proper cross-validation or for exploratory analysis.
+
+Learned embeddings: train an embedding (e.g. via a small NN) based on predictive task — more work but flexible.
+
+Gower / mixed distance: combine categorical distance (0/1 or encoded) with numeric distances; you must choose a weight to balance types.
+
+
+In practice:
+
+If venue count < ~20 → one-hot + optional PCA is fine.
+
+If venue count is large → frequency or one-hot→SVD (TruncatedSVD) is preferred.
+
+If you care about leakage from past outcomes (slippage), avoid target encoding unless you do CV.
+
+
+
+---
+
+Method A — cheap & robust: binary same/different (recommended first try)
+
+Idea: when computing distance, add w_venue * (venue != center_venue) as an extra squared term.
+
+Advantages: simple, fast, interpretable (either same venue or not). Great when you expect events at the same venue to cluster.
+
+Drop this into your neighbors function.
+
+# -----------------------
+# Binary same/different
+# -----------------------
+def neighbors_with_venue_binary(df_day, obj_idx, eps1, eps2_minutes, time_col='startTime', venue_col='venue', w_venue=0.5):
+    """
+    w_venue is the (scaled) penalty for being at a different venue (tune it).
+    """
+    center = df_day.loc[obj_idx]
+    t0 = center[time_col]
+    if pd.isna(t0):
+        return []
+    min_time = t0 - pd.Timedelta(minutes=eps2_minutes)
+    max_time = t0 + pd.Timedelta(minutes=eps2_minutes)
+    cand = df_day[(df_day[time_col] >= min_time) & (df_day[time_col] <= max_time)]
+    if cand.shape[0] == 0:
+        return []
+    # numeric distances (example using f_qty and f_price)
+    dq = (cand['f_qty'].to_numpy() - center['f_qty'])**2
+    dp = (cand['f_price'].to_numpy() - center['f_price'])**2
+    # categorical venue distance: 0 if same, 1 if different
+    if venue_col in df_day.columns:
+        venue_diff = (cand[venue_col].to_numpy() != center[venue_col]).astype(float)
+    else:
+        venue_diff = np.zeros(len(cand))
+    # combined distance: sqrt(dq + dp + (w_venue * venue_diff)**2)
+    dist = np.sqrt(dq + dp + (w_venue * venue_diff)**2)
+    mask = (dist <= eps1)
+    mask &= (cand.index.to_numpy() != obj_idx)
+    return list(cand.index.to_numpy()[mask])
+
+Tune: start with w_venue=0.5 and eps1 ~ 0.5–1.0 (same units as numeric scaled features). Increase w_venue if you want DBSCAN to prefer same-venue points (i.e., treat different venues as far away).
+
+
+---
+
+Method B — one-hot → TruncatedSVD (dense low-dim venue vectors)
+
+When you have many venues or want more nuanced similarity between venues (e.g., venues that often behave similarly), compress one-hot to a small numeric embedding. Then concatenate embeddings with numeric features and run DBSCAN on combined space.
+
+Steps:
+
+1. OneHot encode venues to sparse matrix.
+
+
+2. Run TruncatedSVD to get k dense dimensions per venue.
+
+
+3. Join the k dims to your scaled numeric features.
+
+
+4. Use the usual Euclidean distance over the full vector.
+
+
+
+Code (requires sklearn):
+
+from sklearn.preprocessing import OneHotEncoder, RobustScaler
+from sklearn.decomposition import TruncatedSVD
+
+def encode_venue_onehot_svd(df, venue_col='venue', n_components=6, min_freq=1):
+    """
+    Returns an (N, n_components) numpy array with dense embeddings for venue.
+    - filters out very rare venues if you want (min_freq)
+    """
+    venues = df[venue_col].fillna('<<MISSING>>').astype(str).values.reshape(-1,1)
+    # optionally, group rare venues -> 'RARE'
+    if min_freq > 1:
+        vc = pd.Series(venues.ravel()).value_counts()
+        rare = set(vc[vc < min_freq].index)
+        venues = np.array([("RARE" if v in rare else v) for v in venues.ravel()]).reshape(-1,1)
+
+    enc = OneHotEncoder(sparse=True, handle_unknown='infrequent_if_exist')  # fallback: for older sklearn use handle_unknown='ignore'
+    X_sparse = enc.fit_transform(venues)   # shape (N, n_unique_venues)
+
+    # reduce dimensions
+    svd = TruncatedSVD(n_components=min(n_components, X_sparse.shape[1]-1 if X_sparse.shape[1]>1 else 1), random_state=42)
+    X_dense = svd.fit_transform(X_sparse)  # shape (N, n_components)
+    return X_dense, enc, svd
+
+def add_features_with_venue_svd(df, qty_col='grossOrdered', price_col='priceExecuted', venue_col='venue',
+                                venue_components=6, w_qty=1.0, w_price=1.0):
+    # numeric features (scale)
+    df2 = df.copy()
+    qty = pd.to_numeric(df2[qty_col], errors='coerce').fillna(0.0).to_numpy()
+    price = pd.to_numeric(df2[price_col], errors='coerce').fillna(0.0).to_numpy()
+    numeric = np.column_stack([qty, price])
+    scaler = RobustScaler()
+    numeric_scaled = scaler.fit_transform(numeric)
+    # encode venue
+    X_venue, enc, svd = encode_venue_onehot_svd(df2, venue_col=venue_col, n_components=venue_components)
+    # apply per-feature weights if desired: multiply numeric columns; also scale venue dims to comparable scale
+    numeric_scaled[:,0] *= w_qty
+    numeric_scaled[:,1] *= w_price
+    # scale venue axes to roughly same scale as numeric (optionally)
+    # simple normalization: divide by median absolute deviation of numeric and venue dims
+    # concatenate
+    X_full = np.hstack([numeric_scaled, X_venue])
+    # attach back to df for inspection
+    for i in range(X_full.shape[1]):
+        df2[f'feat_{i}'] = X_full[:, i]
+    # also attach f_qty/f_price convenience names (first two)
+    df2['f_qty'] = X_full[:,0]
+    df2['f_price'] = X_full[:,1]
+    return df2, enc, svd, scaler
+
+How to use: call add_features_with_venue_svd to get df2 with f_qty, f_price, and extra compressed venue dims. Then use your standard neighbors which computes Euclidean distance on f_qty,f_price — modify it to use all feat_* columns (or pass X_full as the array used for distances).
+
+Example neighbors using full vector:
+
+def neighbors_full_vector(df_day, obj_idx, eps1, eps2_minutes, time_col='startTime', feature_cols=None):
+    center = df_day.loc[obj_idx]
+    t0 = center[time_col]
+    if pd.isna(t0):
+        return []
+    min_time = t0 - pd.Timedelta(minutes=eps2_minutes)
+    max_time = t0 + pd.Timedelta(minutes=eps2_minutes)
+    cand = df_day[(df_day[time_col] >= min_time) & (df_day[time_col] <= max_time)]
+    if cand.shape[0] == 0:
+        return []
+    if feature_cols is None:
+        # automatically use any column that starts with 'feat_' we created earlier
+        feature_cols = [c for c in df_day.columns if c.startswith('feat_')]
+    center_vec = center[feature_cols].to_numpy().astype(float)
+    cand_mat = cand[feature_cols].to_numpy().astype(float)
+    diffs = cand_mat - center_vec[None, :]
+    dist = np.sqrt(np.sum(diffs**2, axis=1))
+    mask = (dist <= eps1) & (cand.index.to_numpy() != obj_idx)
+    return list(cand.index.to_numpy()[mask])
+
+Tune: n_components (try 3–10), possibly scale down SVD dims if they dominate numeric axes (use RobustScaler on combined matrix).
+
+
+---
+
+Example: combine both approaches (binary + SVD)
+
+If you want both “same venue is special” and similarity between venues modeled by SVD, you can:
+
+Use SVD embeddings for general venue similarity.
+
+Add an extra binary “same venue” dimension (0/1) with its own weight to strongly prefer same-venue neighbors.
+
+
+When building X_full, append is_same_venue column set to 0/1 (but that depends on center — easier to implement in neighbors function as delta).
+
+
+---
+
+How to choose weights and eps
+
+After encoding, compute the scale (MAD or std) of numeric features and venue features; pick w_venue so that w_venue * venue_component_scale is roughly comparable to numeric distances you care about.
+
+Practical heuristic: run a small grid:
+
+eps1 from 0.3 → 1.5 (if features are RobustScaled).
+
+w_venue from 0.0 → 2.0.
+Visual checks: use feature-space plot and time plot to verify clusters look sensible.
+
+
+If a venue dimension is dominating clusters (too many clusters split by venue), reduce its scaling.
+
+
+
+---
+
+When to use target/mean encoding (slippage) — CAUTION
+
+If you want to encode venue by historical slippage (e.g., venue A historically worse), that’s target encoding. It’s powerful but leaks: you must compute encodings out-of-sample when testing. Only use for final models or exploratory analysis (not to define clusters that you will then evaluate on the same data).
+
+If you want to see whether venues with similar slippage group together, you can compute venue_mean_slippage on a rolling or earlier period and use that as a numeric feature.
+
+
+---
+
+Diagnostics to run after encoding
+
+1. df['venue'].nunique() — how many venues? choose method accordingly.
+
+
+2. Inspect SVD variance: svd.explained_variance_ratio_.sum() — how much venue variation captured by n_components.
+
+
+3. Plot first two venue components vs numeric features to make sure they’re not dominating.
+
+
+4. Run k-distance elbow on the combined features to pick eps1.
+
+
+
+
+---
+
+Final short cookbook (what I would try, in order)
+
+1. Start simple: binary same/different; set w_venue=0.5; run ST-DBSCAN. Inspect time plot.
+
+
+2. If too coarse/you have many venues: do one-hot→SVD (n=6), concatenate with numeric features, run standard ST-DBSCAN on combined vector.
+
+
+3. If you want to capture venue quality (slippage) use mean encoding but only computed from a non-overlapping history window.
+
+
+4. Tune eps1, eps2, w_venue visually (feature and time plots).
+
+
+
+
+---
+
+If you want, I’ll:
+
+paste a ready-to-run full example that starts from your original DataFrame (startTime, grossOrdered, priceExecuted, orderSide, venue), builds SVD encodings, runs ST-DBSCAN and plots time and feature space colourised by cluster — adapted to your column names.
+
+
+Say “yes” and I’ll output that full runnable cell right away.
+
