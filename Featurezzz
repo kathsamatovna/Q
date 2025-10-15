@@ -1,0 +1,25 @@
+
+
+1. Time + Price Offset:
+Just take the timestamp of the order and how far the order price is from the mid-price. That gives you a basic idea of when and how aggressively they place orders.
+
+
+2. Time + Price Offset + Order Size:
+Add the size of the order into the mix. This way you're clustering on time, aggressiveness, and how large each order is.
+
+
+3. Time + Price Offset + Algo Type:
+Here, include whether the algo is aggressive or non-aggressive as a categorical feature. That can help you see if aggressive and non-aggressive orders form different clusters.
+
+
+4. Time + Price Offset + Instrument or Currency:
+If you have different instruments or currencies, add that as a feature. That might show you if certain instruments cluster differently in terms of timing and pricing.
+
+
+5. All of the Above:
+You can try combining time, price offset, order size, algo type, and instrument all together. That’s a bigger feature set, but it might reveal more nuanced patterns.
+
+
+
+So with these sets, you can kind of mix and match and see which one gives you the clearest insights into how these orders are clustering.
+
