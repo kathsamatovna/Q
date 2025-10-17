@@ -1,0 +1,58 @@
+Got it—I re-looked at your screenshots. The reason the 5-minute window “fails” is not the mask itself; it’s that your temporal window moves as you expand the cluster:
+
+In ST_DBSCAN, you call neighbors(df_day, CurrentObj, eps1, eps2, ...).
+
+Inside neighbors(...) you set
+t0 = df_day.loc[obj, time_col].
+
+So every time you pop a new CurrentObj, the center time t0 shifts to that row’s time.
+DBSCAN then “walks” in 5-minute hops and can span hours via transitivity.
+
+
+Minimal fix (no rewrite)
+
+Anchor the temporal window to the seed point of the cluster and keep it fixed while expanding.
+
+1. Patch neighbors to accept an optional ref_time and use it if provided:
+
+
+
+def neighbors(df_day, obj, eps1, eps2, time_col='startTime', ref_time=None):
+    center = df_day.loc[obj]
+    t0 = center[time_col] if ref_time is None else ref_time
+
+    # (keep your existing min_time / max_time logic)
+    min_time = t0 - pd.Timedelta(minutes=eps2)
+    max_time = t0 + pd.Timedelta(minutes=eps2)
+
+    # (keep your existing candidate/time mask + distance code)
+    ...
+    return list(cand.index.values[mask])
+
+2. In ST_DBSCAN, capture the seed time once and pass it on every expansion:
+
+
+
+seed_time = df_day.loc[key, time_col]
+
+x = neighbors(df_day, key, eps1, eps2, time_col=time_col, ref_time=seed_time)
+...
+while stack:
+    CurrentObj = stack.pop()
+    y = neighbors(df_day, CurrentObj, eps1, eps2, time_col=time_col, ref_time=seed_time)
+
+That’s it. Now every point added must be within ±5 minutes of the original seed, so the cluster can’t drift across hours.
+
+Quick sanity check
+
+i = df_day.index[0]
+seed_time = df_day.loc[i, 'startTime']
+idxs = neighbors(df_day, i, eps1, 5, time_col='startTime', ref_time=seed_time)
+assert (df_day.loc[idxs, 'startTime'] - seed_time).abs().le(pd.Timedelta('5min')).all()
+
+Optional (tiny) guard
+
+If you still have a stray “same day” filter, drop it—it can silently exclude valid neighbors near midnight. The ±5-min anchor already prevents cross-day bleed.
+
+This one change (fixed reference time) is the usual culprit when ST-DBSCAN “ignores” a 5-minute window but grows via chained activity.
+
