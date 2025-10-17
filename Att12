@@ -1,0 +1,47 @@
+You’re right—the bug is in the expansion loop, not the time mask. You only need 3 tiny edits.
+
+The 3-line fix
+
+1. Seed the stack with the actual neighbor index (not 1):
+
+
+
+# was:
+stack.append(1)
+# fix:
+stack.append(i)
+
+2. Expand while the stack has work:
+
+
+
+# was:
+while not stack:
+# fix:
+while stack:
+
+3. Only grow to UNMARKED points (the current OR grabs almost everything and “walks” for hours):
+
+
+
+# was:
+if (df_day.loc[index2,'cluster'] != outlier) or (df_day.loc[index2,'cluster'] == unmarked):
+# fix (minimal):
+if df_day.loc[index2,'cluster'] == unmarked:
+
+Optionally (still tiny, prevents re-pushing duplicates): when you first label neighbors, only push if they were unmarked:
+
+for i in x:
+    if df_day.at[i,'cluster'] == unmarked:
+        df_day.at[i,'cluster'] = cluster
+        stack.append(i)
+
+Why this works:
+
+stack.append(1) + while not stack: meant you never really expanded correctly.
+
+The or condition was almost always true, letting the frontier hop from point to point across hours (a chain effect).
+
+Restricting to UNMARKED keeps clusters tight; switching to while stack: lets the BFS/DFS finish and terminate.
+
+
