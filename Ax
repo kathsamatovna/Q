@@ -1,0 +1,94 @@
+Perfect — yes, you’re absolutely right 👏
+If your two functions already take their own parameters (like dataframes, arrays, or column names), you just pass those alongside the ax object when you call them.
+
+The trick is:
+you keep all their parameters exactly the same — you just add one optional argument (like ax=None) to control where the plot is drawn.
+
+
+---
+
+Example with parameters
+
+Let’s say your functions look like this:
+
+def plot_orders(df, trader_id):
+    subset = df[df['trader'] == trader_id]
+    plt.plot(subset['time'], subset['order_qty'], color='blue', label='Orders')
+    plt.ylabel('Order Quantity')
+    plt.xlabel('Time')
+
+and
+
+def plot_fills(df, trader_id):
+    subset = df[df['trader'] == trader_id]
+    plt.plot(subset['time'], subset['fill_qty'], color='red', label='Fills')
+    plt.ylabel('Fill Quantity')
+    plt.xlabel('Time')
+
+Both functions currently use the global pyplot state (so they each create their own plot).
+
+
+---
+
+✅ Modify them slightly
+
+Make them accept an optional ax parameter, and direct all plotting to that axis instead of the global one:
+
+def plot_orders(df, trader_id, ax=None):
+    subset = df[df['trader'] == trader_id]
+    if ax is None:
+        ax = plt.gca()  # fallback: use current axis
+    ax.plot(subset['time'], subset['order_qty'], color='blue', label='Orders')
+    ax.set_ylabel('Order Quantity', color='blue')
+
+def plot_fills(df, trader_id, ax=None):
+    subset = df[df['trader'] == trader_id]
+    if ax is None:
+        ax = plt.gca()
+    ax.plot(subset['time'], subset['fill_qty'], color='red', label='Fills')
+    ax.set_ylabel('Fill Quantity', color='red')
+
+
+---
+
+🧭 Combine them on the same X axis
+
+Now you can do this:
+
+fig, ax1 = plt.subplots()
+
+plot_orders(df, trader_id=123, ax=ax1)
+
+ax2 = ax1.twinx()
+plot_fills(df, trader_id=123, ax=ax2)
+
+ax1.set_xlabel('Time')
+fig.suptitle(f"Trader {trader_id}: Orders vs Fills")
+
+# shared legend
+lines1, labels1 = ax1.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+
+plt.show()
+
+
+---
+
+⚙️ General pattern
+
+You can extend this to any number of parameters:
+
+def my_plot(data, param1, param2, ax=None, color='k', linestyle='-'):
+    ...
+
+and still call:
+
+my_plot(data, param1=..., param2=..., ax=ax1)
+
+
+---
+
+Would you like to show me what your two functions look like (just their definitions + plot lines)?
+I can rewrite them exactly so they’ll both plot on shared X with dual Y axes while keeping all your existing formatting intact.
+
