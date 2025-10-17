@@ -1,0 +1,101 @@
+Yep — the temporal window isn’t your culprit now. The cluster is “walking” across hours because of a couple of logic bugs in the expansion loop:
+
+What’s wrong in your screenshots
+
+1. You seed the stack with stack.append(1) (literal 1).
+You must push the seed index (key) or a neighbor of it. Pushing 1 reuses the same row over and over (or a wrong row).
+
+
+2. The loop uses while not stack:.
+That runs only when the stack is empty. It should be while stack: (keep expanding until empty).
+
+
+3. The neighbor-label test is using OR:
+
+
+
+if (df_day.loc[index2, 'cluster'] != outlier) or (df_day.loc[index2, 'cluster'] == unmarked):
+
+That condition is true for almost everything (all non-outliers or unmarked), so you keep adding nearly everyone to the cluster, bridging time step-by-step over hours. In DBSCAN you want:
+
+if label == NOISE → relabel to current cluster (border), do not push
+
+if label == UNMARKED → relabel and, only if it’s a core point, push to stack
+
+otherwise (already labeled) → skip
+
+
+4. You never guard against re-pushing the same index, so when you flip to while stack: it can loop forever.
+
+
+
+Drop-in fixed core (keep your neighbors(...))
+
+UNMARKED = -2
+NOISE    = -1
+
+def ST_DBSCAN(df_day, eps1, eps2, min_samples, time_col='startTime'):
+    # initialize
+    labels = np.full(len(df_day), UNMARKED, dtype=int)
+    idx = df_day.index.to_numpy()
+    pos = {i:k for k,i in enumerate(idx)}  # map index->row number if you need it
+
+    cluster_id = 0
+
+    for key, row in df_day.iterrows():
+        if labels[pos[key]] != UNMARKED:
+            continue
+
+        N = neighbors(df_day, key, eps1, eps2, time_col=time_col)
+        if len(N) < min_samples:
+            labels[pos[key]] = NOISE
+            continue
+
+        cluster_id += 1
+        labels[pos[key]] = cluster_id
+
+        # seed stack with neighbors except self
+        stack = [n for n in N if n != key]
+        seen  = set([key])  # optional, keeps stack small
+
+        while stack:
+            q = stack.pop()
+            if q in seen:
+                continue
+            seen.add(q)
+
+            lab = labels[pos[q]]
+            if lab == NOISE:
+                # border point becomes part of cluster, but don't expand from it
+                labels[pos[q]] = cluster_id
+                continue
+            if lab != UNMARKED:
+                # already assigned to some cluster
+                continue
+
+            # assign and (maybe) expand
+            labels[pos[q]] = cluster_id
+            Nq = neighbors(df_day, q, eps1, eps2, time_col=time_col)
+
+            # only core points propagate the frontier
+            if len(Nq) >= min_samples:
+                # push only those not already visited
+                for r in Nq:
+                    if r not in seen and r != q:
+                        stack.append(r)
+
+    df_out = df_day.copy()
+    df_out['cluster'] = labels
+    return df_out
+
+Why this fixes the “3-hour cluster”
+
+We only expand from core points (neighbors ≥ min_samples). Border points join the cluster but don’t propagate — that stops the chain effect that was hopping in 5-minute steps across hours.
+
+We never add already-labeled points and we track seen, so while stack: terminates.
+
+We seed with the actual indices, not 1.
+
+
+If you still see hour-spanning clusters after this, that means you genuinely have a connected chain of core points every ≤5 minutes (a “percolation” chain). In that case, either tighten eps1/min_samples, or adopt ST-DBSCAN* (requiring both points to be within eps2 of a shared reference time window, not just pairwise).
+
