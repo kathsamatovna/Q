@@ -1,0 +1,78 @@
+Short answer: your 5-minute window is being short-circuited by the extra “same-day” filter and (in a few runs) by mixed/naive vs tz-aware datetimes. The time mask never matches what you expect, so you end up pulling neighbors from outside (or from none of) the intended 5-minute band.
+
+What’s happening in your neighbors(...):
+
+t0 = center[time_col]                            # Timestamp (often tz-aware)
+min_time = t0 - pd.Timedelta(minutes=eps2)
+max_time = t0 + pd.Timedelta(minutes=eps2)
+
+same_day = df_day[time_col].dt.date == t0.date() # <- brittle, loses timezone info
+cand = df_day[same_day
+              & (df_day[time_col] >= min_time)
+              & (df_day[time_col] <= max_time)]
+
+Problems:
+
+1. dt.date drops the timezone; t0.date() is computed in the timezone of t0. If df_day[time_col] is tz-aware UTC but date was created earlier in local time (or vice-versa), rows near midnight won’t pass same_day. Even if you group by a separate date column, this extra “same-day” line can still exclude valid neighbors within ±5 min (and make it look like the temporal filter “doesn’t work”).
+
+
+2. The time mask is fine, but combining it with same_day is redundant and harmful—your ±5 min window already prevents cross-day bleed.
+
+
+3. In a few notebooks you parse startTime with utc=True but elsewhere compare against naive timestamps. Pandas will happily refuse to compare tz-aware with naive, so most people worked around it—leaving subtle mismatches.
+
+
+
+Fix (robust and minimal):
+
+Make startTime consistently tz-aware (or consistently naive). Easiest is UTC everywhere.
+
+Remove the “same day” constraint. Let the ±5-minute window do the work.
+
+Use between(...) to build the mask (clearer and less error-prone).
+
+
+# Ensure consistent dtype once, right after loading:
+df_day[time_col] = pd.to_datetime(df_day[time_col], utc=True)
+
+def neighbors(df_day, obj, eps1, eps2, time_col='startTime'):
+    center = df_day.loc[obj]
+
+    t0 = center[time_col]                             # tz-aware UTC Timestamp
+    win = pd.Timedelta(minutes=int(eps2))             # eps2 is minutes
+    min_time = t0 - win
+    max_time = t0 + win
+
+    # Temporal candidates: ±eps2 minutes around t0
+    mask_time = df_day[time_col].between(min_time, max_time, inclusive='both')
+    cand = df_day.loc[mask_time]
+
+    # distances in scaled feature space (qty/price/side/venue)
+    dq = cand['f_qty'  ].to_numpy() - center['f_qty'  ]
+    dp = cand['f_price'].to_numpy() - center['f_price']
+    ds = cand['f_side' ].to_numpy() - center['f_side' ]
+    dv = cand['f_venue'].to_numpy() - center['f_venue']
+    dist = np.sqrt(dq*dq + dp*dp + ds*ds + dv*dv)
+
+    # spatial radius + exclude the center itself
+    mask = (dist <= eps1) & (cand.index.values != obj)
+    return list(cand.index.values[mask])
+
+Sanity checks you can run once to confirm it’s truly “5 minutes”:
+
+# pick a random index i and verify neighbors are within ±5 min
+i = df_day.index[0]
+idxs = neighbors(df_day, i, eps1=0.8, eps2=5, time_col='startTime')
+t0 = df_day.loc[i, 'startTime']
+assert all((df_day.loc[idxs, 'startTime'] - t0).abs() <= pd.Timedelta(minutes=5))
+
+Common gotchas to avoid:
+
+Passing eps2 in seconds (e.g., 300) while your code treats it as minutes → becomes 300 minutes. Keep it as 5, or change the code to seconds=eps2.
+
+Creating a separate df['date'] in local time and grouping on that, then filtering on startTime in UTC. If you still want a date column, derive it from the same time_col:
+df['date'] = df[time_col].dt.tz_convert('UTC').dt.floor('D') (or just dt.floor('D') if already UTC).
+
+
+Make those two changes (drop same_day; unify timezone) and your 5-minute temporal filter will behave exactly as intended.
+
