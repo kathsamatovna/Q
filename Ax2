@@ -1,0 +1,105 @@
+Totally fine—you can keep plt.subplots() inside your functions and still make them composable. The trick is to put plt.subplots() behind a small guard so it only runs when the function is used standalone. When you want to combine them, you pass an ax (and skip creating a new figure).
+
+Here’s a drop-in pattern you can copy:
+
+import matplotlib.pyplot as plt
+
+def plot_A(df, a, b, *, ax=None, **style):
+    created_fig = False
+    if ax is None:
+        # Standalone mode
+        fig, ax = plt.subplots()
+        created_fig = True
+
+    lineA, = ax.plot(df['x'], df['yA'], label='A', **style)
+    ax.set_ylabel('A', color=lineA.get_color())
+    ax.tick_params(axis='y', colors=lineA.get_color())
+
+    # return useful things for both modes
+    if created_fig:
+        # caller expects a complete figure
+        ax.set_xlabel('X')
+        fig.tight_layout()
+        return fig, ax, [lineA]
+    else:
+        # caller is composing; don’t touch layout/show
+        return ax, [lineA]
+
+
+def plot_B(df, p, q, *, ax=None, **style):
+    created_fig = False
+    if ax is None:
+        fig, ax = plt.subplots()
+        created_fig = True
+
+    lineB, = ax.plot(df['x'], df['yB'], label='B', **style)
+    ax.set_ylabel('B', color=lineB.get_color())
+    ax.tick_params(axis='y', colors=lineB.get_color())
+
+    if created_fig:
+        ax.set_xlabel('X')
+        fig.tight_layout()
+        return fig, ax, [lineB]
+    else:
+        return ax, [lineB]
+
+Use cases
+
+1) Standalone (your current behavior stays intact)
+
+figA, axA, _ = plot_A(df, a=1, b=2, color='tab:blue')
+# (Optionally) plt.show() here if you want
+
+2) Combined on one X with two Y axes (composition mode)
+
+fig, ax1 = plt.subplots()
+
+# Left Y (A)
+ax1, lines1 = plot_A(df, a=1, b=2, ax=ax1, color='tab:blue')
+
+# Right Y (B), same X
+ax2 = ax1.twinx()
+ax2, lines2 = plot_B(df, p=3, q=4, ax=ax2, color='tab:red')
+
+# Shared X label/title only once here (since functions didn’t create their own fig)
+ax1.set_xlabel('X')
+fig.suptitle('A vs B')
+
+# Optional: move the right spine outward for clarity
+ax2.spines['right'].set_position(('outward', 40))
+
+# One legend for both
+labels1 = [h.get_label() for h in lines1]
+labels2 = [h.get_label() for h in lines2]
+ax1.legend(lines1 + lines2, labels1 + labels2, loc='best')
+
+fig.tight_layout()
+plt.show()
+
+Why this works
+
+Your functions still call plt.subplots() when no ax is provided → fully standalone.
+
+When you pass ax=..., they skip creating a new figure and just draw on the axes you gave them → perfect for dual-axis composition.
+
+No plt.show() inside the functions (good!). You control showing/layout at the very end.
+
+
+If you must keep plt.subplots() always running
+
+If that’s absolutely required, add a flag:
+
+def plot_A(df, a, b, *, ax=None, force_new_fig=False, **style):
+    created_fig = False
+    if force_new_fig or ax is None:
+        fig, ax = plt.subplots()
+        created_fig = True
+    ...
+
+Then in combined mode call plot_A(..., ax=ax1, force_new_fig=False) and plot_B(..., ax=ax2, force_new_fig=False).
+
+
+---
+
+If you paste your two function headers + their plotting lines, I’ll convert them to this pattern verbatim so you can drop them back into your codebase with zero behavior change.
+
