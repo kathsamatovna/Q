@@ -1,0 +1,161 @@
+That’s a very good instinct — that exact plot is one of the cleanest ways to visualise trader market impact or execution quality per cluster.
+
+Let’s unpack what you’d actually be seeing and how to interpret it. 👇
+
+
+---
+
+🔹 Setup of your plot
+
+You have:
+
+X-axis: total fill quantity per cluster → Σ(fillQty) or totalVolume.
+
+Y-axis: (avg executed price per cluster) − (mid price at execution time)
+→ call this “price deviation” or “impact”.
+
+
+Each point on that plot = one cluster (a burst or parent order episode).
+
+
+---
+
+🔹 What the plot represents
+
+It’s essentially impact vs aggressiveness:
+
+Axis	Interpretation
+
+X (Total fill)	how much volume the trader executed in that cluster — cluster size or trade intensity
+Y (Price difference)	how far they traded from the prevailing mid — i.e. the cost of crossing the spread or moving the market
+
+
+
+---
+
+🔹 Expected shapes & regimes
+
+You’ll typically see one of these patterns:
+
+1️⃣ Upward-sloping curve
+
+As total fill (X) increases, the price deviation (Y) increases.
+
+This is the classic market impact curve: larger bursts cause worse average execution prices (more slippage).
+
+Mathematically it’s often sublinear:
+, with .
+
+
+You might see something like this:
+
+^
+ ΔP  |         .
+     |       .
+     |    .
+     | .
+     +------------------>
+             Volume
+
+
+---
+
+2️⃣ Flat near zero for small fills
+
+Small clusters (likely passive orders or child fills of small size) don’t move the mid price.
+
+You may even see negative deviations if the trader provides liquidity (executing slightly better than mid).
+
+
+
+---
+
+3️⃣ Nonlinear bursts
+
+If you colour points by side (buy/sell):
+
+Buy clusters will sit mostly above zero (paying ask side).
+
+Sell clusters will sit below zero (hitting bid side).
+
+
+You may find asymmetry — e.g. buys suffer higher slippage in illiquid NDFs.
+
+
+
+---
+
+4️⃣ Cluster‐type separation
+
+If you colour or mark by:
+
+Algorithm type
+
+Venue
+
+Time of day
+
+
+Then:
+
+Certain algos (like VWAP) should have smaller |Y| for same X.
+
+Voice or aggressive sweeps might have steeper slopes.
+
+
+That tells you which trading behaviour or venue yields lower impact for same notional.
+
+
+---
+
+🔹 Statistical angle
+
+If you fit a log–log regression:
+
+\log(|\text{avgPrice} - \text{midPrice}|) = \alpha + \beta \log(\text{totalFill})
+
+Then  gives your impact elasticity — the empirical “square-root law” coefficient.
+
+You can also compute correlation between cluster size and deviation to test monotonicity.
+
+
+---
+
+🔹 Possible refinements
+
+Normalize the deviation by spread:
+
+
+Plot separately for buy vs sell (two colours).
+
+Overlay time order (earlier vs later sessions) to see liquidity changes.
+
+Include only clusters with > N child orders to focus on strategic execution bursts.
+
+
+
+---
+
+🔹 In summary
+
+Plot:
+
+> Y: execution–mid deviation per cluster
+X: total fill size per cluster
+
+
+
+You’ll likely observe:
+
+upward slope → impact grows with cluster size
+
+flatter slope → efficient / internalised flow
+
+asymmetry by side or algo → reveals trader strategy differences.
+
+
+
+---
+
+If you want, I can show a Python snippet that computes those cluster-level aggregates (avg_price, mid_price, total_fill) and produces a clean scatter plot with buy/sell colours and regression fit — would you like that?
+
