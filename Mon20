@@ -1,0 +1,120 @@
+You’re hitting the classic “The truth value of an array is ambiguous. Use a.any() or a.all()” error.
+It happens when an array of booleans (or distances) is used where Python expects a single True/False—typically inside an if ...:. In your ST-DBSCAN this usually comes from something like:
+
+dist = ...  # vector of distances
+if dist <= eps1:         # ❌ dist is an array -> ambiguous in an if
+    ...
+
+or from passing an array mask into if while iterating df.iterrows().
+
+Below is a corrected, fully vectorised neighbor search and an ST-DBSCAN loop that never uses an array in an if. It (1) windows by time (same day and within ±eps2 minutes), (2) computes feature distance correctly, and (3) returns a list of indices, so you only ever compare lengths to min_samples.
+
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+
+def neighbors(df_day, obj, eps1, eps2, time_col='startTime'):
+    """
+    Return list of integer indices (row positions) that are neighbors of point `obj`
+    within temporal window ±eps2 minutes on the same day AND within feature radius eps1.
+    Assumes feature columns: f_qty, f_price, f_side, f_venue (already scaled).
+    """
+    center = df_day.loc[obj]  # row (Series)
+
+    # --- temporal filter: same day, within ±eps2 minutes ---
+    t0 = center.at[time_col]
+    min_time = t0 - pd.Timedelta(minutes=eps2)
+    max_time = t0 + pd.Timedelta(minutes=eps2)
+
+    same_day = df_day[time_col].dt.date == t0.date()
+    cand = df_day[same_day & df_day[time_col].between(min_time, max_time, inclusive='both')]
+
+    # --- feature deltas (vectorized) ---
+    # Treat venue as *categorical distance* (0 if same, 1 if different), not subtraction
+    dq = cand['f_qty'].to_numpy()   - float(center.at['f_qty'])
+    dp = cand['f_price'].to_numpy() - float(center.at['f_price'])
+    ds = cand['f_side'].to_numpy()  - float(center.at['f_side'])
+    dv = (cand['f_venue'].to_numpy() != float(center.at['f_venue'])).astype(float)
+
+    dist = np.sqrt(dq*dq + dp*dp + ds*ds + dv*dv)
+
+    # mask: within feature radius and exclude the center itself
+    mask = (dist <= eps1) & (cand.index.values != obj)
+
+    # return *row positions* (ints), not boolean arrays
+    return list(df_day.index.get_indexer(cand.index.values[mask]))
+
+def ST_DBSCAN(df_day, eps1, eps2, min_samples, time_col='startTime'):
+    """
+    df_day must contain columns: time_col, f_qty, f_price, f_side, f_venue (scaled/encoded).
+    Returns a pandas Series `cluster` with labels: 1..K for clusters, -1 for noise.
+    """
+    # work with integer positions for speed/clarity
+    idx = df_day.index.to_list()
+    n = len(idx)
+
+    UNVISITED, NOISE = -2, -1
+    labels = np.full(n, UNVISITED, dtype=int)
+
+    # map row label -> position
+    pos = {ix:i for i,ix in enumerate(idx)}
+
+    cluster_id = 0
+    for ix in idx:
+        i = pos[ix]
+        if labels[i] != UNVISITED:
+            continue
+
+        N = neighbors(df_day, ix, eps1, eps2, time_col)
+        if len(N) < min_samples:
+            labels[i] = NOISE
+            continue
+
+        cluster_id += 1
+        labels[i] = cluster_id
+        stack = [pos[jx] for jx in N]
+
+        while stack:
+            j = stack.pop()
+            if labels[j] == NOISE:
+                labels[j] = cluster_id
+            if labels[j] != UNVISITED:
+                continue
+            labels[j] = cluster_id
+
+            jx = idx[j]
+            Nj = neighbors(df_day, jx, eps1, eps2, time_col)
+            if len(Nj) >= min_samples:
+                stack.extend(pos[kx] for kx in Nj if labels[pos[kx]] in (UNVISITED, NOISE))
+
+    return pd.Series(labels, index=idx, name='cluster').replace({UNVISITED: NOISE})
+
+Why this fixes your error
+
+neighbors(...) returns a list of indices, not a boolean array or distance array.
+
+In the core check we use if len(N) < min_samples: — a scalar truth, no ambiguity.
+
+We never write if dist <= eps1: or if mask: inside loops.
+
+
+A few gotchas to double-check in your data
+
+1. Center scalars: use center.at['col'] (or float(...)) to be sure you have scalars, not 1-length arrays/Series.
+
+
+2. Categoricals: don’t subtract venues; use equality → 0/1 (or a weight if you like).
+
+
+3. Side encoding: encode BUY/SELL to +1/−1 before scaling; or include it as a separate dimension with an appropriate weight.
+
+
+4. Time column dtype: ensure df_day[time_col] is datetime64[ns] (and timezone-consistent).
+
+
+5. Scaling: make f_qty, f_price, f_side (and the venue weight) roughly commensurate; otherwise eps1 won’t be meaningful.
+
+
+
+If you paste this in place of your current neighbor calc/loop, the “a.any/a.all” ambiguity should disappear. If it persists, show me the exact line it flags and the dtypes for your four f_* columns and startTime—that will let me pinpoint the remaining culprit quickly.
+
