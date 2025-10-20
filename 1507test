@@ -1,0 +1,132 @@
+Excellent — you’re thinking about this exactly like a market microstructure analyst now.
+Let’s unpack carefully what you just said, because every detail changes how that plot behaves.
+
+
+---
+
+🧩 What you’re describing now
+
+You said:
+
+> I want to plot the difference from mid for each fill in a cluster,
+against the cumulative total fill within that cluster,
+and my clusters can have mixed buy/sell fills.
+
+
+
+So for each cluster :
+
+Sort its fills in time order.
+
+Compute Δprice_i = execPrice_i − midPrice_i for every fill i.
+
+Compute X_i = cumulative sum of fillQty_i (within that cluster).
+
+Plot Y = Δprice_i vs X = cumulative fill_i.
+
+
+That gives a trajectory of how execution slippage evolves as that burst unfolds.
+
+
+---
+
+💡 Intuition for what you’ll see
+
+🔸 If the cluster is mostly one-sided (e.g. a buy sweep):
+
+You’ll get an upward-sloping, concave curve — the classic impact curve.
+
+ΔPrice ↑
+        |       .
+        |    .
+        |  .
+        |.
+        +----------------> Cumulative fill
+
+The first fills are near mid (small deviation).
+
+As more volume trades, the trader “walks the book,” paying higher prices.
+
+The curve often follows a square-root law:
+.
+
+
+🔸 If the cluster switches sides (mixed buy/sell):
+
+You’ll see zig-zag or looping trajectories — the average may hover near zero because buys and sells cancel in price impact.
+
+That’s expected for internalised or hedging bursts, not directional execution.
+
+
+---
+
+🧮 How to code it (cluster by cluster)
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# assume df has: cluster, ts, fillQty, execPrice, midPrice, side
+df = df.sort_values(["cluster", "ts"]).copy()
+df["price_diff"] = df["execPrice"] - df["midPrice"]
+
+# cumulative fill per cluster (absolute, so mixed sides still increase volume)
+df["cum_fill"] = df.groupby("cluster")["fillQty"].cumsum()
+
+fig, ax = plt.subplots(figsize=(7, 5))
+
+for cluster_id, g in df.groupby("cluster"):
+    ax.plot(g["cum_fill"], g["price_diff"], alpha=0.4)
+
+ax.axhline(0, color="gray", lw=1, ls="--")
+ax.set_xlabel("Cumulative fill within cluster")
+ax.set_ylabel("Exec − Mid price per fill")
+ax.set_title("Intra-cluster impact trajectories")
+plt.show()
+
+
+---
+
+⚙️ Variants depending on what you want to see
+
+Goal	Change
+
+Compare direction	colour by side (BUY/SELL)
+Normalise prices	plot price_diff / midPrice
+Focus on impact magnitude	plot abs(price_diff)
+See averaged pattern	aggregate by volume percentiles across clusters
+
+
+
+---
+
+🔍 Why this curve often looks exponential / concave
+
+When plotted in linear scale, it looks exponential because early fills move the mid only slightly, then impact accelerates and saturates.
+In theory and empirical studies, it’s sublinear (square-root-like):
+
+E[|\Delta P|] \propto V_\text{cum}^{\alpha}, \quad 0.4 \lesssim \alpha \lesssim 0.7
+
+That concave curve is exactly what you’ll recognise as the market impact function.
+If you log–log plot |Δprice| vs cum_fill, you’ll get an almost straight line whose slope = α.
+
+
+---
+
+🔹 Summary
+
+You’re plotting intra-cluster market impact trajectories:
+
+Quantity	Symbol	Description
+
+X-axis		cumulative fill within the cluster
+Y-axis		instantaneous slippage
+
+
+And yes — if your clusters are mostly one-sided, you’ll see that smooth, concave, almost-exponential rise in |ΔP| as cumulative fill increases.
+If they’re mixed or hedged, you’ll get noisy, symmetric loops around zero.
+
+
+---
+
+Would you like me to show how to overlay the average curve across all clusters (so you can quantify that α exponent)?
+
