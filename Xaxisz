@@ -1,0 +1,100 @@
+Perfect — let’s make this concrete.
+
+You want X = total fill per cluster, Y = (avg executed price − avg mid price) per cluster.
+
+Here’s exactly how to compute and plot it in pandas + matplotlib.
+
+
+---
+
+✅ Example setup
+
+Assume your df has at least:
+
+column	meaning
+
+cluster	cluster label (integer, from your ST-DBSCAN)
+fillQty	fill quantity of each child order
+execPrice	execution price of that order
+midPrice	mid price at that time
+side	"BUY" / "SELL"
+
+
+
+---
+
+🧮 Aggregate per cluster
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Cluster-level aggregates
+df_cluster = (
+    df.groupby("cluster")
+      .agg(
+          total_fill=("fillQty", "sum"),
+          avg_exec=("execPrice", "mean"),
+          avg_mid=("midPrice", "mean"),
+          side=("side", "first"),  # assuming cluster = one side
+      )
+      .reset_index()
+)
+
+# Price deviation: execution price minus mid price
+df_cluster["price_diff"] = df_cluster["avg_exec"] - df_cluster["avg_mid"]
+
+
+---
+
+📈 Plot the X axis and Y axis
+
+fig, ax = plt.subplots(figsize=(7, 5))
+
+colors = df_cluster["side"].map({"BUY": "tab:red", "SELL": "tab:blue"})
+ax.scatter(
+    df_cluster["total_fill"],
+    df_cluster["price_diff"],
+    c=colors,
+    alpha=0.7,
+)
+
+ax.axhline(0, color="gray", lw=1, ls="--")
+ax.set_xlabel("Total fill per cluster")
+ax.set_ylabel("Average exec − mid price")
+ax.set_title("Execution deviation vs total fill per cluster")
+plt.show()
+
+
+---
+
+🔧 If your X-axis is too wide
+
+Use a log scale:
+
+ax.set_xscale("log")
+
+That’s very common because cluster sizes can vary over orders of magnitude.
+
+
+---
+
+💡 Optional refinements
+
+Normalise deviation by mid price or half-spread:
+
+df_cluster["norm_diff"] = (df_cluster["avg_exec"] - df_cluster["avg_mid"]) / df_cluster["avg_mid"]
+
+Fit and overlay a trend line:
+
+import numpy as np
+coeffs = np.polyfit(np.log(df_cluster["total_fill"]), np.log(df_cluster["price_diff"].abs()), 1)
+beta = coeffs[0]
+
+which gives the impact elasticity.
+
+
+
+---
+
+So your X-axis is simply df_cluster["total_fill"] — the sum of fills for each cluster — and the scatter plot shows how impact grows as clusters become larger or more aggressive.
+
