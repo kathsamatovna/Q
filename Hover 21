@@ -1,0 +1,41 @@
+Short answer: no—just swapping the names/labels of ax1 and ax2 won’t fix your hover.
+The problem is which axes is on top (event ownership), not what you call them.
+
+Because twinx() puts ax2 above ax1, mouse events hit ax2. If your hover only handles ax1, it’ll never fire—even if you “swap labels.”
+
+Pick one of these quick fixes:
+
+A) Keep hover on ax1 only (make ax2 transparent to events)
+
+# after ax2 = ax1.twinx()
+ax2.set_zorder(ax1.get_zorder() - 1)   # put ax2 behind ax1
+ax2.patch.set_visible(False)           # no facecolor blocking
+# optional: ax2.set_frame_on(False)
+
+B) Handle hover for both axes
+
+def on_hover(event):
+    if event.inaxes not in (ax1, ax2):
+        return
+    ax = event.inaxes
+    # use ax-specific logic (lines, scales, etc.)
+    # draw annotation on `ax`, not always ax1:
+    annot = ax.annotations[0] if ax.annotations else ax.annotate("", (0,0))
+    # update annot.xy = (event.xdata, event.ydata); annot.set_text(...); fig.canvas.draw_idle()
+
+cid = fig.canvas.mpl_connect("motion_notify_event", on_hover)
+
+C) Artist-based hit test (robust with multiple lines)
+
+def on_hover(event):
+    for line in ax1.lines + ax2.lines:
+        hit, _ = line.contains(event)
+        if hit:
+            ax = line.axes  # the owning axes (ax1 or ax2)
+            # update annotation on `ax`
+            break
+
+Also make sure you annotate on the axes that received the event (or the line’s axes), otherwise coordinates won’t match when the y-scales differ.
+
+So: don’t swap labels—either push ax2 behind ax1 or make your hover callback handle both.
+
