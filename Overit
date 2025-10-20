@@ -1,0 +1,69 @@
+Got it — you’re keeping it simple 
+
+You have a DataFrame like this:
+
+cluster	fill	price_diff
+
+0	200	0.0012
+0	150	0.0014
+1	80	-0.0008
+1	100	-0.0006
+…	…	…
+
+
+You just want one line per cluster,
+x = fill (or cumulative fill),
+y = price_diff (slippage).
+
+Here’s the cleanest way to do it:
+
+
+---
+
+ Basic version
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(7,5))
+
+for clust, g in df.groupby("cluster"):
+    ax.plot(g["fill"], g["price_diff"], marker="o", alpha=0.6, label=f"cluster {clust}")
+
+ax.axhline(0, color="gray", lw=1, ls="--")
+ax.set_xlabel("Fill")
+ax.set_ylabel("Price difference (slippage)")
+ax.set_title("Per-cluster fills vs slippage")
+ax.legend()
+plt.show()
+
+That’s it — one line per cluster.
+
+
+---
+
+Optional: cumulative fill within cluster
+
+If your fill column is just the fill size, and you want X = total filled so far, add:
+
+df = df.sort_values(["cluster", "fill"])  # or by timestamp if you have one
+df["cum_fill"] = df.groupby("cluster")["fill"].cumsum()
+
+Then plot g["cum_fill"] instead of g["fill"]:
+
+for clust, g in df.groupby("cluster"):
+    ax.plot(g["cum_fill"], g["price_diff"], alpha=0.6)
+
+
+---
+
+ Interpretation
+
+Each line = one cluster’s progression in execution.
+
+Upward (for buys) or downward (for sells) slope → increasing slippage as the cluster consumes liquidity.
+
+If it curves concavely upward → the classic “impact curve.”
+
+
+That’s all you need — one groupby + ax.plot loop.
+
