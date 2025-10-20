@@ -1,0 +1,109 @@
+Excellent and subtle question — this is one of those matplotlib gotchas that bites anyone who starts using twin axes + interactivity.
+
+Here’s what’s happening 👇
+
+
+---
+
+🔍 Root cause
+
+When you call:
+
+ax2 = ax1.twinx()
+
+matplotlib actually creates a second Axes object (ax2) that sits on top of the first one in the figure’s z-order (like layers in Photoshop).
+
+That means:
+
+your hover (motion_notify_event) or pick_event listeners that were attached to ax1 no longer receive mouse events in regions where ax2 covers it (which is the whole plot area).
+
+the topmost axes (the “active one” in front) captures all the mouse events.
+
+
+So even though you’re hovering over data that visually belongs to ax1, the event is now being captured by ax2, which either:
+
+doesn’t have your annotation or event handler, or
+
+returns None because your callback checks for event.inaxes == ax1.
+
+
+
+---
+
+✅ The fix depends on what you want
+
+Option 1: Share a single hover callback across both axes
+
+You can attach the same callback to both ax1 and ax2:
+
+def on_hover(event):
+    if event.inaxes in [ax1, ax2]:
+        # use event.xdata, event.ydata, etc.
+        # optionally detect which axis:
+        if event.inaxes == ax1:
+            # annotate data from ax1
+            pass
+        elif event.inaxes == ax2:
+            # annotate data from ax2
+            pass
+
+fig.canvas.mpl_connect("motion_notify_event", on_hover)
+
+→ this ensures both axes can trigger hover logic.
+
+
+---
+
+Option 2: Make the bottom axis (ax1) capture events
+
+If you really only want to interact with ax1, set ax2 to be transparent to mouse events:
+
+ax2.set_zorder(ax1.get_zorder() - 1)
+ax2.patch.set_visible(False)
+ax2.set_frame_on(False)
+
+That pushes ax2 behind ax1 and makes its background transparent, so ax1 gets mouse events again.
+⚠️ But if ax2 has filled plots (e.g. fill_between), those still draw over ax1.
+
+
+---
+
+Option 3: Explicitly check coordinates
+
+You can also query all axes manually:
+
+def on_hover(event):
+    for ax in fig.axes:
+        if ax == event.inaxes:
+            # handle whichever is active
+            ...
+
+
+---
+
+Option 4 (advanced): Use fig.canvas.callbacks.connect with custom hit testing
+
+If you’re doing complex hover annotation with multiple lines, consider using contains(event) manually:
+
+for line in ax1.lines + ax2.lines:
+    contains, _ = line.contains(event)
+    if contains:
+        # do something
+
+This works even if twinx axes overlap, because you explicitly test all line artists rather than relying on which axis the event came from.
+
+
+---
+
+🧠 In short:
+
+Problem	Cause	Fix
+
+Hover stops after twinx()	Top axis steals mouse events	Attach callback to both axes or move ax2 behind ax1
+
+
+
+---
+
+If you show me your exact hover code (the on_hover function and how you connect it), I can give you the exact one-line patch (either adding ax2 to the listener or flipping the z-order).
+
