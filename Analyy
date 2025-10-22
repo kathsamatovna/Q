@@ -1,0 +1,132 @@
+Excellent question — you’re already in the right direction conceptually. If you’ve observed lower market impact for voice traders despite fewer trades, and you can also break down their order types (IOC, GTC, etc.) per parent order, there are several analytical paths you can follow to uncover why this happens. Let’s structure it step by step:
+
+
+---
+
+🧩 1. Normalize for trade size and aggressiveness
+
+Before inferring "less market impact = better," make sure you’re comparing like with like.
+
+Plot impact vs. total traded volume per parent order for both e-system and voice.
+→ If voice traders trade smaller effective sizes, their lower impact may just reflect smaller risk transfer.
+
+Aggressiveness metric: compute (execution price – mid price) × side at order entry — see if voice trades are less aggressive (closer to mid).
+→ That would suggest they “work” the order better, rather than “crossing the spread.”
+
+
+
+---
+
+📊 2. Execution trajectory analysis (timing dimension)
+
+If you can reconstruct child orders (IOC/GTC) within the same parent order:
+
+Compute time-weighted execution trajectory: how long the order takes to complete, and how the mid moves during that window.
+
+Plot impact vs. duration and impact vs. inter-arrival time between child orders.
+→ Voice may have longer spacing or wait for liquidity, which smooths out their footprint.
+
+
+You can even fit a simple power-law or exponential model for temporary impact  and compare exponents α for voice vs. eRisk.
+
+
+---
+
+💡 3. Order-type strategy decomposition
+
+Since you can count IOC vs. GTC for each parent order:
+
+Compute ratios such as
+
+
+R_{\text{IOC}} = \frac{\text{#IOC children}}{\text{total children}}, \quad
+  R_{\text{GTC}} = \frac{\text{#GTC children}}{\text{total children}}
+
+If IOC-heavy orders correlate with higher impact, but voice traders use fewer of them (or time them differently), that’s a structural reason for their lower footprint.
+
+
+---
+
+🧠 4. Venue and liquidity conditioning
+
+Voice trades are often executed:
+
+Off-venue or internally crossed (less visible to market).
+
+In larger notional blocks but at average market price rather than immediate fill.
+
+
+If your dataset includes venue or liquidity depth / book imbalance features:
+
+Compare the mid-price movement on the primary venue after internal (voice) trades vs. external (e) trades.
+
+Use a matched-pair analysis: match trades of similar size, symbol, time of day, and compare post-trade price drift.
+
+
+
+---
+
+🧮 5. Impact decay / resilience
+
+Measure post-trade price decay — how quickly the market reverts after a trade.
+
+Define Δt windows (e.g., +1 s, +10 s, +30 s after fill) and measure median mid-price change.
+
+Voice trades often show faster reversion, implying liquidity provision or internal crossing rather than genuine information content.
+
+
+
+---
+
+📈 6. Parent order decomposition
+
+If you can map parent→child orders:
+
+Compute per-parent VWAP execution vs. arrival mid — call it "implementation shortfall."
+
+Compare dispersion of child execution prices around parent VWAP.
+
+Look for patterns:
+→ Voice traders may “anchor” fills near mid, while e-system orders follow a time-sliced trajectory with higher variance.
+
+
+
+---
+
+⚙️ 7. Cross-sectional regression / feature importance
+
+You can run a simple regression or tree model:
+
+\text{impact} \sim \beta_0 + \beta_1 \cdot \log(\text{size}) + \beta_2 \cdot \text{aggressiveness} + \beta_3 \cdot \text{order type ratios} + \beta_4 \cdot \text{channel (voice/e)} + \epsilon
+
+→ If the “voice” dummy remains significant after controlling for size, type, timing, then it implies a behavioral / routing difference rather than structural.
+
+
+---
+
+🔍 8. Strategic interpretation
+
+Your hypotheses could include:
+
+1. Voice trades are pre-negotiated (matched internally, no book impact).
+
+
+2. They use less aggressive child order types (GTC instead of IOC bursts).
+
+
+3. They wait for liquidity (temporal clustering).
+
+
+4. They net internally with e-risk flow (crossing offsetting positions).
+
+
+5. Their trades occur during lower volatility windows or when spread is narrower.
+
+
+
+Each can be tested with the metrics above.
+
+
+---
+
+Would you like me to sketch some Python plots / feature calculations (e.g. impact vs IOC ratio, or post-trade reversion plots) that you can apply directly to your dataset? That would make these analyses immediately actionable.
