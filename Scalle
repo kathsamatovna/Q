@@ -1,0 +1,116 @@
+Perfect — you’re hitting a subtle but very common gotcha.
+Let’s go step-by-step and make it fully plug-and-play for your notebook (with your variables like grossOrdered, priceExecuted, dealSide, etc.).
+
+
+---
+
+🧩 What’s going wrong
+
+When you pass scaler=StandardScaler, you’re actually passing the class, not a fitted object.
+So when the code later calls scaler.transform(xy) it fails, because the class itself doesn’t have the .transform() method — only a fitted instance does.
+
+In other words:
+
+scaler = StandardScaler()      # ✅ create an instance
+scaler.fit(X)                  # ✅ fit it
+scaler.transform(X)            # ✅ now works
+
+vs.
+
+scaler = StandardScaler        # ❌ just the class, no methods bound
+
+
+---
+
+✅ Correct way to handle scaling in your ST-DBSCAN
+
+You have two clean options depending on how you want scaling to behave.
+
+
+---
+
+Option 1: Fit a scaler once per 5-minute side bucket (recommended)
+
+This keeps each bucket self-contained, avoids cross-bucket scaling distortion, and guarantees no leaks.
+
+from sklearn.preprocessing import RobustScaler
+import pandas as pd
+import numpy as np
+
+def run_stdbscan_per_bucket(df, eps_space, eps_time_s, min_samples):
+    df = df.copy()
+    df['bucket5'] = df['startTime'].dt.floor('5min')
+    results = []
+
+    for (bkt, side), g in df.groupby(['bucket5', 'dealSide'], sort=False):
+        if len(g) < min_samples:
+            continue
+
+        # --- fit scaler on numeric columns only
+        X = g[['grossOrdered', 'priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+        scaler = RobustScaler().fit(X)
+
+        # --- run ST-DBSCAN with the fitted scaler
+        g_clustered = ST_DBSCAN(
+            g, eps_space=eps_space, eps_time_s=eps_time_s,
+            min_samples=min_samples, qty_col='grossOrdered',
+            price_col='priceExecuted', side_col='dealSide',
+            scaler=scaler
+        )
+        results.append(g_clustered)
+
+    return pd.concat(results).sort_index()
+
+Then call:
+
+df_clusters = run_stdbscan_per_bucket(df, eps_space=0.8, eps_time_s=300, min_samples=5)
+
+
+---
+
+Option 2: Use a global scaler once for the entire dataset
+
+If your quantities and prices are in similar ranges across the day (e.g., same instrument, consistent magnitude), you can scale once globally and pass that instance around.
+
+from sklearn.preprocessing import StandardScaler
+
+# Fit once on the whole day
+X_all = df[['grossOrdered', 'priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+global_scaler = StandardScaler().fit(X_all)
+
+# Now run ST-DBSCAN for each bucket, reusing the same fitted scaler
+df_clusters = run_stdbscan_per_bucket(df, eps_space=0.8, eps_time_s=300, min_samples=5)
+
+Inside run_stdbscan_per_bucket, you can change it to accept scaler as an argument if you want full control.
+
+
+---
+
+Minimal inline use (for testing)
+
+If you just want to test one group manually:
+
+from sklearn.preprocessing import StandardScaler
+
+g = df.iloc[:200].copy()
+X = g[['grossOrdered','priceExecuted']].to_numpy()
+scaler = StandardScaler().fit(X)
+
+df_test = ST_DBSCAN(g, eps_space=0.8, eps_time_s=300, min_samples=5,
+                    qty_col='grossOrdered', price_col='priceExecuted',
+                    side_col='dealSide', scaler=scaler)
+
+
+---
+
+⚙️ Quick sanity check before clustering
+
+Make sure the columns are numeric and have no NaNs before scaling:
+
+df[['grossOrdered','priceExecuted']] = df[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+
+
+---
+
+Would you like me to show you exactly where to plug these 3–4 lines into your existing notebook code (using the same ST_DBSCAN and neighbors functions you already have)?
+I can point to the precise cell where to initialize and pass the scaler.
