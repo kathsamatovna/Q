@@ -1,0 +1,155 @@
+Got you. What you’re seeing is classic density-reachability chaining: once a core point is found, DBSCAN keeps expanding via neighbors of neighbors; if your neighbor check lets time/side change at each hop, a cluster can “walk” across 5-min buckets and flip BUY↔SELL.
+
+Here’s how to stop the leakage fast.
+
+
+---
+
+1) Treat time & side as hard constraints, not scaled features
+
+Don’t scale dealSide and don’t let the time window slide during expansion.
+
+Key idea
+
+Pick a seed point for a cluster with (seed_time, seed_side).
+
+Every neighbor test in the entire expansion must satisfy:
+
+abs(ts - seed_time) <= eps_time
+
+dealSide == seed_side
+
+numeric distance (qty/price only) <= eps_space
+
+
+
+Patch your neighbor function
+
+from datetime import timedelta
+import numpy as np
+import pandas as pd
+
+def neighbors(df, idx, eps_space, eps_time, seed_time=None, seed_side=None, qty_col='grossOrdered',
+              price_col='priceExecuted', side_col='dealSide', scaler=None):
+    # seed invariants for the whole cluster
+    if seed_time is None:
+        seed_time = df.at[idx, 'startTime']
+    if seed_side is None:
+        seed_side = df.at[idx, side_col]
+
+    # HARD filters (no sliding window!)
+    time_mask = (df['startTime'].sub(seed_time)).abs() <= pd.Timedelta(seconds=eps_time)
+    side_mask = df[side_col].eq(seed_side)
+
+    cand = df.loc[time_mask & side_mask]
+
+    # features: only numeric ones here
+    x0 = pd.to_numeric(df.at[idx, qty_col], errors='coerce')
+    p0 = pd.to_numeric(df.at[idx, price_col], errors='coerce')
+
+    xy = cand[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+    x = np.array([x0, p0], dtype=float)
+
+    # robust scale once outside (supply a fitted scaler); otherwise use IQR scaling inline
+    if scaler is not None:
+        xy = scaler.transform(xy)
+        x  = scaler.transform(x.reshape(1,-1))[0]
+
+    d = np.linalg.norm(xy - x, axis=1)
+    return cand.index[d <= eps_space].tolist()
+
+Patch your ST-DBSCAN expansion
+
+def ST_DBSCAN(df_day, eps_space, eps_time_s, min_samples,
+              qty_col='grossOrdered', price_col='priceExecuted', side_col='dealSide',
+              scaler=None):
+    # preconditions
+    df_day = df_day.sort_values('startTime').copy()
+    df_day['cluster'] = -2     # unmarked
+    OUTLIER = -1
+    cid = 0
+
+    for idx in df_day.index:
+        if df_day.at[idx, 'cluster'] != -2:
+            continue
+
+        seed_time = df_day.at[idx, 'startTime']
+        seed_side = df_day.at[idx, side_col]
+
+        N = neighbors(df_day, idx, eps_space, eps_time_s,
+                      seed_time, seed_side, qty_col, price_col, side_col, scaler)
+
+        if len(N) < min_samples:
+            df_day.at[idx, 'cluster'] = OUTLIER
+            continue
+
+        # create new cluster bounded by the seed’s window & side
+        cid += 1
+        df_day.loc[N, 'cluster'] = cid
+        stack = [i for i in N if i != idx]
+
+        while stack:
+            j = stack.pop()
+            if df_day.at[j, 'cluster'] == OUTLIER:
+                df_day.at[j, 'cluster'] = cid
+
+            if df_day.at[j, 'cluster'] == cid:
+                Nj = neighbors(df_day, j, eps_space, eps_time_s,
+                               seed_time, seed_side, qty_col, price_col, side_col, scaler)
+                if len(Nj) >= min_samples:
+                    for k in Nj:
+                        if df_day.at[k, 'cluster'] in (-2, OUTLIER):
+                            df_day.at[k, 'cluster'] = cid
+                            stack.append(k)
+    return df_day
+
+Why this works: because every hop uses the same (seed_time, seed_side), the cluster can’t “walk” into a later 5-min window or flip direction.
+
+
+---
+
+2) (Even stricter) Run per bucket & side
+
+If you want an absolute cap, pre-bucket then cluster—zero chance of bleed:
+
+df['bucket5'] = df['startTime'].dt.floor('5min')
+out = []
+for (bkt, side), g in df.groupby(['bucket5', 'dealSide'], sort=False):
+    if len(g) < 2: 
+        continue
+    # fit scaler per group on [qty, price]
+    from sklearn.preprocessing import RobustScaler
+    scaler = RobustScaler().fit(g[['grossOrdered','priceExecuted']].to_numpy())
+    res = ST_DBSCAN(g, eps_space=eps1, eps_time_s=5*60, min_samples=min_pts,
+                    qty_col='grossOrdered', price_col='priceExecuted',
+                    side_col='dealSide', scaler=scaler)
+    out.append(res)
+df_clusters = pd.concat(out).sort_index()
+
+This also removes the need to encode side at all.
+
+
+---
+
+3) Common gotchas I can see in your screenshots
+
+timedelta(minutes=int(eps2)): if eps2 is not an integer number of minutes you’re flooring it. Use a Timedelta directly in seconds and avoid casting: pd.Timedelta(seconds=eps_time_s).
+
+You were scaling side with RobustScaler. If the group is imbalanced, the scaled side difference can shrink toward 0 and pass your eps—don’t scale side; filter it.
+
+If you keep the original “sliding” neighbor window, clusters will inevitably “chain” across adjacent 5-min windows. That’s by design, not a bug.
+
+
+
+---
+
+4) If you still see merges
+
+Reduce eps_space or increase min_samples.
+
+Try HDBSCAN (with min_cluster_size, min_samples) on per-bucket groups; it’s less sensitive to eps and reduces chaining.
+
+Consider SNN-DBSCAN (shared nearest neighbors) if bridges caused by dense micro-bursts are the issue.
+
+
+Want me to adapt the patches exactly to your variable names (I can see grossOrdered, priceExecuted, dealSide, startTime) and drop into your notebook as a ready cell?
