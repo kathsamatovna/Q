@@ -1,0 +1,81 @@
+Got it — you want to make a manual bar chart using ax.bar() (not df.plot.bar()) so that you can overlay a line plot using a secondary y-axis (twinx()), without it creating an extra empty subplot.
+
+Here’s how to do it cleanly:
+
+
+---
+
+✅ Example setup
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+# Example data
+df = pd.DataFrame({
+    'category': ['A', 'B', 'C', 'D'],
+    'value1': [3, 7, 2, 5],
+    'value2': [4, 5, 6, 3],
+    'line_metric': [0.2, 0.5, 0.3, 0.4]
+})
+
+
+---
+
+🔹 Unstacked bar chart (using ax.bar)
+
+You want the bars for value1 and value2 side-by-side, not stacked:
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+x = np.arange(len(df['category']))
+width = 0.35  # width of each bar
+
+# Draw bars side by side
+ax.bar(x - width/2, df['value1'], width, label='Value 1', color='skyblue')
+ax.bar(x + width/2, df['value2'], width, label='Value 2', color='orange')
+
+# X-axis labels
+ax.set_xticks(x)
+ax.set_xticklabels(df['category'])
+ax.set_ylabel('Bar values')
+ax.legend(loc='upper left')
+
+
+---
+
+🔹 Overlay a line on a secondary y-axis
+
+Now you can safely add your overlay line with ax2 = ax.twinx():
+
+ax2 = ax.twinx()
+ax2.plot(x, df['line_metric'], color='red', marker='o', label='Line metric')
+ax2.set_ylabel('Line metric')
+
+# Optional: align legends
+lines, labels = ax.get_legend_handles_labels()
+lines2, labels2 = ax2.get_legend_handles_labels()
+ax2.legend(lines + lines2, labels + labels2, loc='upper right')
+
+plt.tight_layout()
+plt.show()
+
+
+---
+
+⚙️ Common pitfalls that cause “empty plots”
+
+1. You used df.plot.bar() first — it internally creates a new figure, so when you call twinx(), it’s on a new empty Axes.
+
+
+2. You called plt.subplots() twice — ensure both plots are drawn on the same ax object.
+
+
+3. You used ax2 = plt.twinx() instead of ax.twinx() — that makes a new empty plot.
+
+
+
+
+---
+
+Would you like me to show the stacked version (bars on top of each other) as well, or keep only side-by-side (“unstacked”)?
