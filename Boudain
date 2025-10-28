@@ -1,0 +1,135 @@
+Perfect — this is exactly the kind of refinement that makes your ST-DBSCAN analysis much more interpretable and statistically robust. Let’s break it down cleanly into two complementary parts:
+
+
+---
+
+🧠 PART 1: Evaluating Your ST-DBSCAN Clusters
+
+➤ Silhouette Score
+
+Silhouette measures how well each point fits within its cluster vs. others.
+Formulaically  , where  = intra-cluster distance,  = nearest-cluster distance.
+
+> ⚠️ Use this only on dense numeric features (e.g. scaled order qty + price).
+If you mix categorical fields or time indices, it becomes meaningless.
+
+
+
+from sklearn.metrics import silhouette_score
+import numpy as np
+
+def evaluate_clusters(df, qty_col='grossOrdered', price_col='priceExecuted', cluster_col='cluster'):
+    valid = df[df[cluster_col] >= 0].copy()              # drop noise
+    if valid[cluster_col].nunique() < 2:
+        return np.nan, np.nan                            # silhouette requires ≥2 clusters
+
+    X = valid[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+    score = silhouette_score(X, valid[cluster_col])
+    return score
+
+Usage:
+
+sil = evaluate_clusters(df_clusters)
+print(f"Silhouette score: {sil:.3f}")
+
+
+---
+
+➤ Davies–Bouldin (Bougainvillea?) Score
+
+I assume you meant Davies-Bouldin, not Bougainvillea 🙂.
+It measures average cluster scatter / separation — lower is better.
+
+from sklearn.metrics import davies_bouldin_score
+
+def db_index(df, qty_col='grossOrdered', price_col='priceExecuted', cluster_col='cluster'):
+    valid = df[df[cluster_col] >= 0].copy()
+    if valid[cluster_col].nunique() < 2:
+        return np.nan
+    X = valid[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+    return davies_bouldin_score(X, valid[cluster_col])
+
+Usage:
+
+dbs = db_index(df_clusters)
+print(f"Davies–Bouldin score: {dbs:.3f}")
+
+
+---
+
+📦 PART 2: Bucketing Orders by Size (or Any Feature)
+
+This lets you ask “Do small vs. large orders cluster differently?”
+
+➤ Example 1 – Fixed-Width Buckets
+
+bins = [0, 1e6, 5e6, 10e6, np.inf]
+labels = ['small','medium','large','huge']
+df['sizeBucket'] = pd.cut(df['grossOrdered'], bins=bins, labels=labels)
+
+➤ Example 2 – Quantile Buckets (equal-count)
+
+df['sizeBucket'] = pd.qcut(df['grossOrdered'], q=4, labels=['Q1','Q2','Q3','Q4'])
+
+
+---
+
+➤ Cluster Separately per Bucket
+
+You can extend your earlier loop to add a third grouping key:
+
+out = []
+for (bkt, side, bucket), g in df.groupby(['bucket5','dealSide','sizeBucket'], sort=False):
+    if len(g) < 5:
+        continue
+    X = g[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+    scaler = RobustScaler().fit(X)
+    g_clustered = ST_DBSCAN(g, eps_space=0.8, eps_time_s=300,
+                            min_samples=5, qty_col='grossOrdered',
+                            price_col='priceExecuted', side_col='dealSide',
+                            scaler=scaler)
+    g_clustered['sizeBucket'] = bucket
+    out.append(g_clustered)
+
+df_clusters = pd.concat(out)
+
+Now you can:
+
+scores = (df_clusters.groupby('sizeBucket')
+          .apply(lambda g: pd.Series({
+              'silhouette': evaluate_clusters(g),
+              'davies_bouldin': db_index(g),
+              'n_clusters': g['cluster'].nunique()
+          })))
+print(scores)
+
+
+---
+
+📈 Optional – Visualize Quality vs. Bucket
+
+import matplotlib.pyplot as plt
+
+plt.figure()
+plt.bar(scores.index, scores['silhouette'])
+plt.title("Silhouette by Order-Size Bucket")
+plt.ylabel("Score")
+plt.show()
+
+
+---
+
+🔍 Summary
+
+Goal	Function / Step
+
+Quantify cohesion/separation	silhouette_score, davies_bouldin_score
+Bucket orders by notional	pd.cut or pd.qcut
+Run ST-DBSCAN within buckets	Group by bucket5 × dealSide × sizeBucket
+Compare cluster quality	Group + evaluate
+
+
+
+---
+
+Would you like me to modify your existing notebook loop (the one that currently buckets only by bucket5 and dealSide) so that it automatically adds size bucketing + evaluation + plots in one go?
