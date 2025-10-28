@@ -1,0 +1,181 @@
+Ah — that’s actually very informative. Those two numbers tell you a lot about what’s going wrong inside the clustering — so let’s interpret them carefully before you tweak anything.
+
+
+---
+
+🔎 1️⃣ What those scores actually mean
+
+Silhouette Score = −0.7
+
+That’s bad — it means most points are closer to points in other clusters than to their own cluster.
+Formally:
+
+s_i = \frac{b_i - a_i}{\max(a_i,b_i)}
+
+Range	Interpretation
+
+0.7 – 1.0	very clear, compact clusters
+0.25 – 0.7	reasonable
+0.0 – 0.25	weak or overlapping
+< 0	points likely mis-assigned / clusters ill-defined
+
+
+So −0.7 implies either:
+
+your eps_space is too large (merging distinct blobs into one),
+
+or your features are not scaled comparably,
+
+or the data is not clusterable in that feature space (continuum density).
+
+
+
+---
+
+Davies–Bouldin ≈ 30 000
+
+Davies–Bouldin (I know you called it Bougainvillea 😄) measures average intra-cluster scatter / inter-cluster separation; lower is better, and typical decent ranges are < 2.
+
+A value like 30 000 means:
+
+Clusters are enormously spread out,
+
+or there are huge scale mismatches (e.g. prices in thousands, quantities in millions),
+
+or there’s one giant cluster + noise scenario.
+
+
+
+---
+
+🧠 2️⃣ Diagnosing step-by-step
+
+✅ Step 1 — Check scaling
+
+If you didn’t scale grossOrdered and priceExecuted together properly, one dominates.
+
+df[['grossOrdered','priceExecuted']] = df[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce')
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler().fit(df[['grossOrdered','priceExecuted']])
+X = scaler.transform(df[['grossOrdered','priceExecuted']])
+
+Then rerun ST-DBSCAN (or at least recompute the metrics on the same scaled features).
+
+
+---
+
+✅ Step 2 — Plot k-distance (elbow) for eps_space
+
+Find the 90th-percentile of k-distances:
+
+from sklearn.neighbors import NearestNeighbors
+k = 5
+nbrs = NearestNeighbors(n_neighbors=k).fit(X)
+distances, _ = nbrs.kneighbors(X)
+k_dist = np.sort(distances[:,k-1])
+plt.plot(k_dist)
+
+→ pick eps_space near the elbow (often much smaller than you think).
+If it’s too big, everything connects; silhouette turns negative.
+
+
+---
+
+✅ Step 3 — Check cluster size distribution
+
+df_clusters['cluster'].value_counts()
+
+If you see 1–2 clusters with thousands of points and many with 1–2 points, eps/minPts are mismatched.
+
+
+---
+
+✅ Step 4 — Check side/time logic
+
+If your neighbor search still allows cross-side or cross-time contamination, you’re mixing incompatible trades; that drives negative silhouette too.
+
+
+---
+
+✅ Step 5 — Try per-bucket silhouette
+
+Compute silhouette separately within each size/time bucket:
+
+for b, g in df_clusters.groupby('sizeBucket'):
+    if g['cluster'].nunique() > 1:
+        s = silhouette_score(g[['grossOrdered','priceExecuted']], g['cluster'])
+        print(b, s)
+
+Often, some buckets are clean and others messy.
+
+
+---
+
+⚙️ 3️⃣ Fix strategies
+
+Problem	Symptom	Fix
+
+eps_space too high	single giant cluster, sil ≈ −1	lower eps_space by ½
+Features unscaled	DB ≫ 1000	Standardise or log-scale quantities
+Time window too large	leaks across bursts	shrink eps_time_s (300 → 120 s)
+Min samples too low	scattered micro-clusters	increase min_samples (5 → 15)
+Real continuum (no clusters)	many overlapping densities	switch to HDBSCAN
+
+
+Example quick retry:
+
+df_clusters = run_stdbscan_per_bucket(df, eps_space=0.3, eps_time_s=120, min_samples=10)
+
+
+---
+
+🧩 4️⃣ If metrics stay bad even after tuning
+
+That’s a signal that density-based clustering isn’t the right geometry for your features — maybe your bursts are better separated temporally than spatially.
+
+Try:
+
+KMeans on cluster summary metrics (duration, qty, price_span) → meta-behaviour grouping.
+
+HDBSCAN (pip install hdbscan) — automatically prunes noise and finds variable-density clusters.
+
+
+import hdbscan
+model = hdbscan.HDBSCAN(min_cluster_size=5, min_samples=10).fit(X)
+df['cluster'] = model.labels_
+
+
+---
+
+📊 5️⃣ Quick sanity-check visuals
+
+plt.scatter(df_clusters['grossOrdered'], df_clusters['priceExecuted'], 
+            c=df_clusters['cluster'], cmap='tab10', s=8)
+plt.title("Cluster scatter – check for overlap")
+
+If you see rainbow mush, it’s not separable → re-scale or re-parametrize.
+
+
+---
+
+✅ TL;DR interpretation of your numbers
+
+Metric	Value	What it tells you
+
+Silhouette = −0.7	Clusters overlap badly or are mis-scaled	
+DB = 30 000	Enormous within-cluster scatter (wrong scale / eps)	
+Likely cause	eps_space too large or missing scaling	
+Next move	Scale features → recompute eps → reduce eps_space → raise min_samples	
+
+
+
+---
+
+If you show me:
+
+your current eps_space, eps_time_s, min_samples
+
+one line of .describe() output for grossOrdered and priceExecuted
+
+
+…I can estimate a good new eps_space and scaling strategy numerically for you.
