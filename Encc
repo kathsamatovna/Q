@@ -1,0 +1,105 @@
+Perfect — yes, you absolutely can.
+If each row in your dataset already has a bucket name (e.g. "small", "medium", "large", etc.), you can turn that into a numeric feature to include in clustering, or simply use it for structured grouping.
+
+The right approach depends on what you want the bucket to mean mathematically.
+
+Let’s go through both cases:
+
+
+---
+
+🧭 1️⃣ If bucket is a hard grouping (recommended for size buckets)
+
+If "sizeBucket" represents distinct, categorical strata (e.g. small vs large orders),
+you shouldn’t let DBSCAN mix them — it’s better to cluster within each bucket.
+
+You can just loop over it like this (no encoder needed):
+
+out = []
+for (bkt, side, bucket), g in df.groupby(['bucket5', 'dealSide', 'sizeBucket'], sort=False):
+    if len(g) < 5:
+        continue
+    X = g[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+    from sklearn.preprocessing import RobustScaler
+    scaler = RobustScaler().fit(X)
+    g_clustered = ST_DBSCAN(
+        g, eps_space=0.8, eps_time_s=300, min_samples=5,
+        qty_col='grossOrdered', price_col='priceExecuted', side_col='dealSide',
+        scaler=scaler
+    )
+    g_clustered['sizeBucket'] = bucket
+    out.append(g_clustered)
+
+df_clusters = pd.concat(out)
+
+That ensures no cross-bucket contamination.
+
+
+---
+
+⚙️ 2️⃣ If bucket is a feature to encode numerically (optional)
+
+Sometimes you might want DBSCAN to see the bucket level but not split by it —
+for example, to slightly separate small and large orders without full segregation.
+
+A. Use Ordinal encoding
+
+Assign a numeric order to your bucket names manually:
+
+bucket_map = {'small': 0, 'medium': 1, 'large': 2, 'huge': 3}
+df['bucket_enc'] = df['sizeBucket'].map(bucket_map).astype(float)
+
+Then add it to your feature matrix:
+
+X_raw = df[['grossOrdered','priceExecuted','bucket_enc']].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+
+from sklearn.preprocessing import StandardScaler
+scaler = StandardScaler().fit(X_raw)
+X = scaler.transform(X_raw)
+
+Then cluster:
+
+from sklearn.cluster import DBSCAN
+labels = DBSCAN(eps=0.6, min_samples=5).fit_predict(X)
+df['cluster'] = labels
+
+Tip: scale bucket_enc separately with a very small weight if you don’t want it to dominate:
+
+X_raw[:,2] *= 0.2  # reduce influence of bucket
+
+
+---
+
+B. Use One-Hot encoding (if buckets have no intrinsic order)
+
+If "small", "medium", "large" aren’t ordinal, do:
+
+from sklearn.preprocessing import OneHotEncoder
+enc = OneHotEncoder(sparse_output=False)
+bucket_features = enc.fit_transform(df[['sizeBucket']])
+
+and concatenate to your numeric matrix:
+
+import numpy as np
+X = np.hstack([X_numeric, bucket_features])
+
+Then feed X into your clustering as usual.
+
+
+---
+
+🧩 3️⃣ Summary — when to encode vs. group
+
+Scenario	Approach	Why
+
+You want DBSCAN per bucket	groupby 'sizeBucket'	cleaner separation, clearer interpretation
+You want DBSCAN to see bucket similarity	ordinal/one-hot encode	allows slight overlap weighting
+You want to measure bucket effect post-hoc	add as a column but not in X	interpretive comparison only
+
+
+
+---
+
+If you tell me what kind of “bucket” values you have (e.g. text categories, numeric ranges, or quantile labels), I can give you a 3-line encoder snippet that matches your data exactly and integrates into your ST_DBSCAN function directly.
+
+Would you like me to show that integration (so ST_DBSCAN automatically handles the bucket encoding inside)?
