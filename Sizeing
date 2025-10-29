@@ -1,0 +1,403 @@
+Perfect — that’s exactly the case we want to handle, and we can make it crystal clear step-by-step.
+
+So you already have something like:
+
+df['sizeBucket'].unique()
+# → ['1–5M', '5–10M', '10–25M', '25M+', ...]
+
+These are categorical string labels you’ve already defined.
+We’ll keep them exactly as they are — no need to re-bin or encode numerically — and simply cluster independently for each bucket so clusters never mix across order-size regimes.
+
+
+---
+
+✅ Step-by-step setup
+
+
+---
+
+🧩 Step 1 — Ensure your main ST-DBSCAN and neighbors functions are ready
+
+Use your current seed-invariant versions (the ones you already have).
+No modification needed for bucket yet.
+
+
+---
+
+🧩 Step 2 — Verify your dataframe columns
+
+You should have at least these columns:
+
+column	type	description
+
+startTime	datetime	timestamp of order/trade
+dealSide	string (‘BUY’/‘SELL’)	trade direction
+grossOrdered	float	order notional or volume
+priceExecuted	float	trade price
+sizeBucket	string	your classification (“1–5M”, etc.)
+
+
+Check:
+
+df[['startTime','dealSide','grossOrdered','priceExecuted','sizeBucket']].head()
+
+
+---
+
+🧩 Step 3 — Group and cluster per bucket
+
+We’ll loop through each (sizeBucket, dealSide, 5-min window) group, scale features, and run ST-DBSCAN inside.
+
+Paste this cell below your existing functions:
+
+from sklearn.preprocessing import RobustScaler
+import pandas as pd
+import numpy as np
+
+def run_stdbscan_per_sizebucket(df,
+                                eps_space=0.6,
+                                eps_time_s=300,
+                                min_samples=6,
+                                qty_col='grossOrdered',
+                                price_col='priceExecuted',
+                                side_col='dealSide',
+                                time_bucket_col='bucket5',
+                                size_bucket_col='sizeBucket'):
+    """
+    Runs ST-DBSCAN independently within each (sizeBucket × dealSide × time-bucket) slice.
+    Each slice is scaled separately; cluster IDs are globally unique.
+    """
+    df = df.sort_values('startTime').copy()
+    out_frames = []
+    global_cluster_offset = 0
+
+    # ensure the 5-min bucket exists
+    if time_bucket_col not in df.columns:
+        df[time_bucket_col] = df['startTime'].dt.floor('5min')
+
+    # iterate over (sizeBucket, side, time bucket)
+    group_keys = [size_bucket_col, side_col, time_bucket_col]
+
+    for keys, g in df.groupby(group_keys, sort=False):
+        size_bkt, side, time_bkt = keys
+
+        if len(g) < min_samples:
+            # mark as noise if too few points
+            tmp = g.copy()
+            tmp['cluster'] = -1
+            out_frames.append(tmp)
+            continue
+
+        # fit a scaler on quantity/price for this slice
+        X = g[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+        scaler = RobustScaler().fit(X)
+
+        clustered = ST_DBSCAN(
+            g,
+            eps_space=eps_space,
+            eps_time_s=eps_time_s,
+            min_samples=min_samples,
+            qty_col=qty_col,
+            price_col=price_col,
+            side_col=side_col,
+            scaler=scaler,
+        )
+
+        # make cluster labels globally unique
+        pos = clustered['cluster'] > 0
+        clustered.loc[pos, 'cluster'] = clustered.loc[pos, 'cluster'] + global_cluster_offset
+
+        if pos.any():
+            global_cluster_offset = int(clustered.loc[pos, 'cluster'].max())
+
+        out_frames.append(clustered)
+
+    # combine all bucket-slice results
+    result = pd.concat(out_frames).sort_index()
+    return result
+
+
+---
+
+🧩 Step 4 — Run it
+
+df_clusters = run_stdbscan_per_sizebucket(
+    df,
+    eps_space=0.6,     # adjust from your k-distance elbow
+    eps_time_s=300,    # 5-minute temporal window
+    min_samples=6
+)
+
+✅ What this does:
+
+for each sizeBucket string (e.g. "1–5M", "5–10M")
+
+for each dealSide (BUY or SELL)
+
+for each bucket5 5-minute interval
+→ it runs an independent ST-DBSCAN.
+
+
+No clusters will ever mix across different order-size categories.
+
+
+---
+
+🧩 Step 5 — Quick sanity check
+
+df_clusters.groupby(['sizeBucket','dealSide'])['cluster'].nunique()
+
+→ gives number of clusters per category and side.
+
+Visual check:
+
+import matplotlib.pyplot as plt
+plt.scatter(df_clusters['grossOrdered'],
+            df_clusters['priceExecuted'],
+            c=df_clusters['cluster'], cmap='tab10', s=10)
+plt.title('Clusters coloured by ST-DBSCAN label (per size bucket)')
+
+
+---
+
+🧠 Why this design is best
+
+Approach	Effect	Why it’s clear
+
+Looping by sizeBucket outside the algorithm	Completely isolates categories	Each bucket has its own local scaling and cluster IDs
+Not encoding sizeBucket numerically	Prevents artificial “distance” between arbitrary categories	'1–5M' ≠ '5–10M' in Euclidean sense
+Global offset	Unique cluster labels across buckets	Easier downstream analysis
+
+
+
+---
+
+🔍 Optional: integrate directly into your HMM or summaries
+
+After clustering:
+
+cluster_summary = (
+    df_clusters[df_clusters['cluster'] > 0]
+    .groupby(['sizeBucket','cluster'])
+    .agg(
+        n_orders=('startTime','size'),
+        total_qty=('grossOrdered','sum'),
+        mean_price=('priceExecuted','mean'),
+        duration_s=('startTime', lambda x: (x.max()-x.min()).total_seconds())
+    )
+    .reset_index()
+)
+
+Now you can analyze clusters per sizeBucket, or feed those into your HMM regime analysis.
+
+
+---
+
+✅ Final recap: You don’t need to encode the string buckets.
+Just group by them explicitly before clustering.
+Each group runs its own ST_DBSCAN, gets its own scaler, and you recombine the results.
+
+Would you like me to add a version of this that also computes silhouette/Davies–Bouldin per bucket automatically (so you can compare clustering quality for “1–5M” vs “10–25M” etc.)?
+
+
+Excellent — let’s extend your per-size-bucket ST-DBSCAN driver so it automatically evaluates Silhouette and Davies–Bouldin (DB) scores for each sizeBucket, along with the count of clusters and noise points.
+
+You’ll get:
+
+a combined df_clusters with all labels (as before),
+
+a quality_table summarizing cluster quality metrics per bucket × side.
+
+
+
+---
+
+🧩 Full drop-in cell (integrated version)
+
+Paste this below your ST_DBSCAN() and neighbors() functions:
+
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+import pandas as pd
+import numpy as np
+
+def run_stdbscan_per_sizebucket(df,
+                                eps_space=0.6,
+                                eps_time_s=300,
+                                min_samples=6,
+                                qty_col='grossOrdered',
+                                price_col='priceExecuted',
+                                side_col='dealSide',
+                                time_bucket_col='bucket5',
+                                size_bucket_col='sizeBucket'):
+    """
+    Runs seed-invariant ST-DBSCAN within each (sizeBucket × side × time bucket) slice.
+    Returns:
+        df_clusters  - all labeled points
+        quality_table - silhouette & Davies–Bouldin per (sizeBucket, side)
+    """
+    df = df.sort_values('startTime').copy()
+
+    # Ensure 5-min bucket exists
+    if time_bucket_col not in df.columns:
+        df[time_bucket_col] = df['startTime'].dt.floor('5min')
+
+    out_frames = []
+    metrics = []
+    global_cluster_offset = 0
+
+    group_keys = [size_bucket_col, side_col, time_bucket_col]
+
+    for keys, g in df.groupby(group_keys, sort=False):
+        size_bkt, side, time_bkt = keys
+
+        if len(g) < min_samples:
+            tmp = g.copy()
+            tmp['cluster'] = -1
+            out_frames.append(tmp)
+            continue
+
+        # Fit scaler for this slice
+        X = g[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+        scaler = RobustScaler().fit(X)
+
+        # Run clustering
+        clustered = ST_DBSCAN(
+            g,
+            eps_space=eps_space,
+            eps_time_s=eps_time_s,
+            min_samples=min_samples,
+            qty_col=qty_col,
+            price_col=price_col,
+            side_col=side_col,
+            scaler=scaler,
+        )
+
+        # Make cluster labels globally unique
+        pos = clustered['cluster'] > 0
+        clustered.loc[pos, 'cluster'] = clustered.loc[pos, 'cluster'] + global_cluster_offset
+        if pos.any():
+            global_cluster_offset = int(clustered.loc[pos, 'cluster'].max())
+
+        out_frames.append(clustered)
+
+        # --- Cluster quality metrics per slice ---
+        valid = clustered[clustered['cluster'] > 0]
+        if valid['cluster'].nunique() > 1:
+            Xv = valid[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+            try:
+                sil = silhouette_score(Xv, valid['cluster'])
+                db  = davies_bouldin_score(Xv, valid['cluster'])
+            except Exception:
+                sil, db = np.nan, np.nan
+        else:
+            sil, db = np.nan, np.nan
+
+        metrics.append({
+            'sizeBucket': size_bkt,
+            'dealSide': side,
+            'timeBucket': time_bkt,
+            'n_orders': len(g),
+            'n_clusters': int((clustered['cluster'] > 0).sum()),
+            'silhouette': sil,
+            'davies_bouldin': db,
+        })
+
+    df_clusters = pd.concat(out_frames).sort_index()
+    quality_table = pd.DataFrame(metrics)
+    return df_clusters, quality_table
+
+
+---
+
+🧩 Step 2 – Run it
+
+df_clusters, quality_table = run_stdbscan_per_sizebucket(
+    df,
+    eps_space=0.6,     # tune via k-distance elbow
+    eps_time_s=300,    # 5-minute temporal window
+    min_samples=6
+)
+
+
+---
+
+🧩 Step 3 – Inspect results
+
+print(quality_table.groupby(['sizeBucket','dealSide'])
+      [['n_orders','n_clusters','silhouette','davies_bouldin']]
+      .mean().round(3))
+
+You’ll get something like:
+
+sizeBucket	dealSide	n_orders	n_clusters	silhouette	davies_bouldin
+
+1–5M	BUY	180	8	0.41	1.32
+1–5M	SELL	150	9	0.38	1.45
+5–10M	BUY	90	5	0.52	0.89
+…	…	…	…	…	…
+
+
+
+---
+
+🧩 Step 4 – Quick visual of quality vs bucket
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(7,4))
+for side, subset in quality_table.groupby('dealSide'):
+    plt.scatter(subset['sizeBucket'], subset['silhouette'], label=side, alpha=0.7)
+plt.axhline(0, color='grey', lw=1)
+plt.ylabel('Silhouette score')
+plt.title('Cluster compactness by size bucket and side')
+plt.legend(); plt.tight_layout(); plt.show()
+
+and similarly for DB index (lower = better).
+
+
+---
+
+🧠 How to interpret
+
+Metric	Good	Bad	Meaning
+
+Silhouette	+0.3 – 1	< 0	Clusters well-separated / compact
+Davies–Bouldin	< 2	≫ 5	Lower = tighter clusters
+n_clusters	contextual	—	Gives density per bucket
+Compare BUY vs SELL	—	—	Directional asymmetry
+
+
+If a particular bucket (say “25M+”) has very low silhouette / very high DB → those trades don’t form dense bursts (maybe rare, heterogeneous orders).
+
+
+---
+
+🧩 Step 5 – Optional save/aggregate
+
+quality_summary = (
+    quality_table
+    .groupby(['sizeBucket','dealSide'])
+    .agg({'silhouette':'mean','davies_bouldin':'mean','n_clusters':'sum'})
+    .reset_index()
+)
+quality_summary.to_csv('cluster_quality_by_bucket.csv', index=False)
+
+
+---
+
+✅ Summary
+
+After this:
+
+df_clusters → all trades with per-bucket ST-DBSCAN cluster labels
+
+quality_table → diagnostics per (sizeBucket, side, time bucket)
+
+You can now quickly see which order-size regimes produce the most coherent temporal bursts.
+
+
+
+---
+
+Would you like me to extend this further so it plots cluster count vs. bucket size (e.g. bar chart comparing how many distinct clusters you get per size regime)?
