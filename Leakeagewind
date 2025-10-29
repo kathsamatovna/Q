@@ -1,0 +1,159 @@
+Great catch. Yes—the seed invariants must be passed on every expansion step, i.e., when you call neighbors for j inside the while-stack loop. If you omit them there, the expansion can “walk” into a different time window or flip side via neighbor-of-neighbor chaining.
+
+Below is a tight, corrected pair of functions that keep (seed_time, seed_side) fixed for the entire cluster.
+
+
+---
+
+Neighbor finder (seed-invariant)
+
+import numpy as np
+import pandas as pd
+
+def neighbors(df, idx, eps_space, eps_time_s,
+              seed_time=None, seed_side=None,
+              qty_col='grossOrdered', price_col='priceExecuted',
+              side_col='dealSide', scaler=None):
+    """
+    Return indices of points that:
+      - are within eps_time_s (seconds) of seed_time (HARD)
+      - have the same side as seed_side (HARD)
+      - are within eps_space in the (qty, price) feature space (after optional scaling)
+    """
+    # Seed invariants
+    if seed_time is None:
+        seed_time = df.at[idx, 'startTime']
+    if seed_side is None:
+        seed_side = df.at[idx, side_col]
+
+    # HARD filters (no sliding window)
+    tmask  = (df['startTime'] - seed_time).abs() <= pd.Timedelta(seconds=eps_time_s)
+    smask  = df[side_col].eq(seed_side)
+    cand   = df.loc[tmask & smask]
+
+    # Feature vectors
+    x0_qty = pd.to_numeric(df.at[idx, qty_col],   errors='coerce')
+    x0_prc = pd.to_numeric(df.at[idx, price_col], errors='coerce')
+    x0     = np.array([x0_qty, x0_prc], dtype=float)
+
+    XY = cand[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+
+    if scaler is not None:
+        XY = scaler.transform(XY)
+        x0 = scaler.transform(x0.reshape(1, -1))[0]
+
+    d = np.linalg.norm(XY - x0, axis=1)
+
+    # Important: align distances back to candidate index order
+    return cand.index.to_numpy()[d <= eps_space].tolist()
+
+Notes:
+
+You don’t need from datetime import timedelta if you’re using pd.Timedelta.
+
+Returning cand.index[d <= eps_space] is correct because d aligns with cand’s row order.
+
+
+
+---
+
+ST-DBSCAN core (always pass the seed invariants)
+
+def ST_DBSCAN(df_day, eps_space, eps_time_s, min_samples,
+              qty_col='grossOrdered', price_col='priceExecuted', side_col='dealSide',
+              scaler=None):
+    """
+    Seed-invariant ST-DBSCAN: clusters cannot leak across the seed's time window or side.
+    """
+    df = df_day.sort_values('startTime').copy()
+    UNVISITED, NOISE = -2, -1
+    df['cluster'] = UNVISITED
+    cid = 0
+
+    for idx in df.index:
+        if df.at[idx, 'cluster'] != UNVISITED:
+            continue
+
+        seed_time = df.at[idx, 'startTime']
+        seed_side = df.at[idx, side_col]
+
+        # 1) Neighborhood around the SEED with seed invariants
+        N = neighbors(df, idx, eps_space, eps_time_s,
+                      seed_time=seed_time, seed_side=seed_side,
+                      qty_col=qty_col, price_col=price_col, side_col=side_col,
+                      scaler=scaler)
+
+        if len(N) < min_samples:
+            df.at[idx, 'cluster'] = NOISE
+            continue
+
+        # 2) Grow new cluster, keeping seed invariants on every hop
+        cid += 1
+        df.loc[N, 'cluster'] = cid
+        stack = [j for j in N if j != idx]
+
+        while stack:
+            j = stack.pop()
+
+            if df.at[j, 'cluster'] == NOISE:
+                df.at[j, 'cluster'] = cid
+
+            if df.at[j, 'cluster'] == cid:
+                # *** CRITICAL: pass seed_time & seed_side again here ***
+                Nj = neighbors(df, j, eps_space, eps_time_s,
+                               seed_time=seed_time, seed_side=seed_side,
+                               qty_col=qty_col, price_col=price_col, side_col=side_col,
+                               scaler=scaler)
+
+                if len(Nj) >= min_samples:
+                    for k in Nj:
+                        if df.at[k, 'cluster'] in (UNVISITED, NOISE):
+                            df.at[k, 'cluster'] = cid
+                            stack.append(k)
+
+    return df
+
+Key point:
+
+The second call Nj = neighbors(...) must include the same seed_time and seed_side as the seed point—not j’s time/side. That’s exactly what prevents time-window drift and side flipping.
+
+
+
+---
+
+(Optional) Also freeze size bucket
+
+If you want strict “no cross-bucket” behavior, add a bucket invariant:
+
+# inside neighbors(...)
+if 'sizeBucket' in df.columns:
+    if 'seed_bucket' not in locals() or seed_side is None:  # parallel to seed_side param
+        seed_bucket = df.at[idx, 'sizeBucket']
+    else:
+        seed_bucket = seed_bucket
+    bmask = df['sizeBucket'].eq(seed_bucket)
+    cand  = df.loc[tmask & smask & bmask]
+
+…and pass seed_bucket through both neighbor calls, just like seed_time/seed_side.
+(Practically, it’s often cleaner to run DBSCAN per bucket via groupby, but this works if you want it inside the expansion.)
+
+
+---
+
+Quick sanity checks you can run
+
+# 1) After clustering, verify invariants hold per cluster:
+chk = (
+    df.groupby('cluster')
+      .apply(lambda g: pd.Series({
+          'min_dt_s': (g['startTime'].max() - g['startTime'].min()).total_seconds(),
+          'sides': tuple(sorted(g['dealSide'].unique())),
+      }))
+)
+print(chk.head())  # expect sides to be singletons and min_dt_s <= 2*eps_time_s
+
+# 2) Ensure scaler is a FITTED instance, not a class:
+# from sklearn.preprocessing import RobustScaler
+# scaler = RobustScaler().fit(df[['grossOrdered','priceExecuted']])
+
+If you drop these versions in, your clusters will no longer “walk” across time windows or side—because every expansion step reuses the seed’s constraints.
