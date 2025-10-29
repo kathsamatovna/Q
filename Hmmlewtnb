@@ -1,0 +1,258 @@
+Awesome—adding a Hidden Markov Model (HMM) on top of your ST-DBSCAN output is a great way to uncover latent execution regimes (e.g., calm schedule vs aggressive sweep). Below is a drop-in, notebook-ready workflow using your column names (startTime, grossOrdered, priceExecuted, dealSide, cluster).
+
+
+---
+
+What this does (in short)
+
+1. Builds per-cluster features (duration, size, price span, tempo, etc.).
+
+
+2. Sorts clusters by start time → time series of cluster features.
+
+
+3. Fits a Gaussian HMM with K hidden states (auto-selects K via BIC).
+
+
+4. Assigns each cluster to a regime and computes transition stats.
+
+
+5. Gives quick plots + tables you can reuse for analysis.
+
+
+
+
+---
+
+0) (Optional) Install
+
+# If needed
+# !pip install hmmlearn --quiet
+
+
+---
+
+1) Make a per-cluster time-ordered feature table
+
+import numpy as np
+import pandas as pd
+
+# Keep only real clusters
+dfc = df_clusters[df_clusters['cluster'] >= 0].copy()
+
+# Per-cluster features
+def _duration_s(ts):
+    ts = ts.sort_values()
+    return (ts.iloc[-1] - ts.iloc[0]).total_seconds()
+
+cluster_summary = (
+    dfc.groupby('cluster')
+    .agg(
+        start_time=('startTime','min'),
+        end_time=('startTime','max'),
+        n_orders=('startTime','size'),
+        total_qty=('grossOrdered','sum'),
+        avg_qty=('grossOrdered','mean'),
+        price_span=('priceExecuted', lambda x: float(np.nanmax(x) - np.nanmin(x))),
+        side=('dealSide','first')
+    )
+    .reset_index()
+)
+
+cluster_summary['duration_s'] = (cluster_summary['end_time'] - cluster_summary['start_time']).dt.total_seconds()
+cluster_summary['duration_s'] = cluster_summary['duration_s'].clip(lower=1.0)
+cluster_summary['tempo'] = cluster_summary['n_orders'] / cluster_summary['duration_s']  # orders per sec
+cluster_summary['impact_slope'] = cluster_summary['price_span'] / cluster_summary['duration_s']  # price units / sec
+cluster_summary['side_num'] = np.where(cluster_summary['side'].str.upper().eq('BUY'), 1.0, -1.0)
+
+# Sort by time (HMM needs sequences in order)
+cluster_summary = cluster_summary.sort_values('start_time').reset_index(drop=True)
+
+> If you have mid-price and want a basic impact measure, add it here (optional): average exec minus mid at cluster start, etc.
+
+
+
+
+---
+
+2) Build the HMM design matrix X
+
+Pick features that are reasonably stationary across the sample. Log-transform heavy-tailed quantities.
+
+from sklearn.preprocessing import StandardScaler
+
+# Choose features (keep it small & robust)
+features = pd.DataFrame({
+    'log_total_qty': np.log1p(cluster_summary['total_qty'].clip(lower=0)),
+    'log_duration_s': np.log1p(cluster_summary['duration_s']),
+    'tempo': cluster_summary['tempo'],
+    'impact_slope': cluster_summary['impact_slope'],
+    'side_num': cluster_summary['side_num'],
+})
+
+# Scale
+scaler_hmm = StandardScaler().fit(features)
+X = scaler_hmm.transform(features)
+
+# Keep mapping for later merges
+cluster_index = cluster_summary['cluster'].to_numpy()
+
+Tips
+
+If tempo or impact_slope are very spiky, clip winsorize (e.g., .clip(upper=features['tempo'].quantile(0.99))).
+
+You can also run separate HMMs by side to isolate BUY/SELL behaviour regimes.
+
+
+
+---
+
+3) Pick the number of hidden states via BIC
+
+from hmmlearn.hmm import GaussianHMM
+
+def fit_hmm_bic(X, min_states=2, max_states=6, cov_type='full', n_iter=400, random_state=0):
+    best = {'bic': np.inf, 'model': None, 'k': None}
+    N = X.shape[0]
+    for k in range(min_states, max_states+1):
+        try:
+            model = GaussianHMM(n_components=k, covariance_type=cov_type,
+                                n_iter=n_iter, random_state=random_state)
+            model.fit(X)
+            logL = model.score(X)
+            # number of free parameters for GaussianHMM with full covariances
+            # mean: k*d, cov: k*d*(d+1)/2, trans: k*(k-1), startprob: (k-1)
+            d = X.shape[1]
+            n_params = k*d + k*(d*(d+1)//2) + k*(k-1) + (k-1)
+            bic = -2*logL + n_params*np.log(N)
+            if bic < best['bic']:
+                best = {'bic': bic, 'model': model, 'k': k}
+        except Exception as e:
+            # if singularities happen, skip
+            continue
+    return best
+
+best = fit_hmm_bic(X, min_states=2, max_states=6, cov_type='full', n_iter=500, random_state=42)
+hmm = best['model']
+print(f"Chosen K (by BIC): {best['k']}, BIC={best['bic']:.1f}")
+
+
+---
+
+4) Decode regimes & attach back to your data
+
+hidden_states = hmm.predict(X)
+cluster_summary['regime'] = hidden_states
+
+# Transition matrix & state stats
+trans_mat = pd.DataFrame(hmm.transmat_, columns=[f"S{j}" for j in range(hmm.n_components)],
+                         index=[f"S{i}" for i in range(hmm.n_components)])
+
+state_means = pd.DataFrame(hmm.means_, columns=features.columns, index=[f"S{i}" for i in range(hmm.n_components)])
+state_vars  = {}
+for i in range(hmm.n_components):
+    state_vars[f"S{i}"] = np.diag(hmm.covars_[i]) if hmm.covariance_type=='diag' else np.diag(hmm.covars_[i])
+state_vars = pd.DataFrame(state_vars, index=features.columns)
+
+# Merge regime back to row-level df if you like
+df_reg = cluster_summary[['cluster','regime']]
+dfc = dfc.merge(df_reg, on='cluster', how='left')
+
+
+---
+
+5) Quick diagnostics & plots
+
+A. Transition matrix (probabilities)
+
+print("Transition matrix:\n", trans_mat.round(3))
+
+B. Regime frequencies and typical stats
+
+summary_by_regime = (
+    cluster_summary
+    .groupby('regime')
+    .agg(
+        n_clusters=('cluster','count'),
+        mean_qty=('total_qty','mean'),
+        median_duration_s=('duration_s','median'),
+        mean_impact_slope=('impact_slope','mean'),
+        buy_share=('side_num', lambda x: (x>0).mean())
+    )
+    .sort_index()
+)
+summary_by_regime
+
+C. Timeline scatter (quick visual)
+
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+plt.figure(figsize=(10,3.5))
+plt.scatter(cluster_summary['start_time'], cluster_summary['total_qty'], c=cluster_summary['regime'], s=16)
+plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+plt.title('Cluster regimes through time')
+plt.xlabel('Start time'); plt.ylabel('Total qty')
+plt.tight_layout(); plt.show()
+
+D. Boxplot duration by regime (matplotlib only)
+
+import numpy as np
+
+data = [cluster_summary.loc[cluster_summary['regime']==r, 'duration_s'].to_numpy()
+        for r in sorted(cluster_summary['regime'].unique())]
+plt.figure(figsize=(6,3.5))
+plt.boxplot(data, labels=[f"S{r}" for r in sorted(cluster_summary['regime'].unique())], showfliers=False)
+plt.ylabel('Duration (s)'); plt.title('Duration by regime'); plt.tight_layout(); plt.show()
+
+
+---
+
+6) How to use the regimes (practical ideas)
+
+Behaviour labels: Inspect state_means (in scaled space) to name states:
+
+high log_total_qty, high impact_slope, short log_duration_s → Aggressive sweep
+
+moderate qty, long duration, low impact_slope → Passive schedule
+
+
+Monitoring: Track regime over time; alert when state switches to an “aggressive” one.
+
+BUY vs SELL: Fit two HMMs on subsets by side to see side-specific regimes.
+
+Market link: Regress (or compare) regime occurrences vs. spread/vol/clock time.
+
+Persistence: Look at the diagonal of trans_mat (Sᵢ→Sᵢ). High values = sticky regimes.
+
+
+
+---
+
+7) Variants & tips
+
+Separate per instrument / desk / venue: Fit an HMM per cohort to compare regime structure.
+
+Regularisation: If you get singular covariances, set covariance_type='diag' or reduce features.
+
+Feature curation: Try replacing tempo with 1 / mean_interarrival, or add n_orders.
+
+Refitting over time: For long periods, refit the HMM on rolling windows (e.g., monthly) to adapt.
+
+
+
+---
+
+Minimal TL;DR
+
+1. Summarise each ST-DBSCAN cluster → a row with size/duration/impact features.
+
+
+2. Standardise features → fit GaussianHMM → decode regime per cluster.
+
+
+3. Inspect transition matrix and state statistics to name regimes and use them in analysis.
+
+
+
+If you want, I can also give you a per-side HMM variant (two models) or an HMM with BIC plots so you can eyeball the chosen K.
