@@ -1,0 +1,131 @@
+That’s a really sharp observation — and you’re absolutely right to question it.
+Let’s unpack this carefully, because it touches on one of the most subtle things about spatio-temporal DBSCAN logic: how “constraints” like side and size bucket should enter the reachability expansion.
+
+
+---
+
+🧠 Recap: what the “seed invariant” fix did
+
+When we added the seed_time and seed_side invariants in your neighbors() function,
+we were fixing a common leakage problem where clusters would “walk” across:
+
+1. time boundaries (e.g. from one 5-min window into the next), and
+
+
+2. order direction boundaries (BUY ↔ SELL).
+
+
+
+That happened because vanilla DBSCAN expansion uses neighbor-of-neighbor chaining.
+If your neighbor function only checked the local point’s side/time each hop, it could hop gradually from one condition to another.
+So we froze the constraints at the seed’s attributes (the cluster’s origin).
+
+# every neighbour in the entire expansion must satisfy these
+abs(ts - seed_time) <= eps_time
+dealSide == seed_side
+
+This prevents a “BUY” cluster starting at 10:01 from merging with a “SELL” cluster at 10:04.
+
+
+---
+
+🔸 Why we didn’t include size bucket in the same invariant
+
+Because bucket size is not inherently continuous or metric — it’s categorical grouping (like instrument or trader).
+The “seed-invariant” idea works for continuous or logically exclusive conditions that define reachability domains, not descriptive categories.
+
+Let’s reason it out:
+
+Feature	Nature	Leakage risk	Should be seed-invariant?	Reason
+
+startTime	continuous, bounded by eps	✅ high	✅ yes	DBSCAN’s “T” dimension
+dealSide	binary, mutually exclusive	✅ high	✅ yes	physically incompatible
+sizeBucket	categorical, fuzzy boundaries	⚠️ low	⚙️ depends	interpretive grouping
+
+
+If you treat size buckets as discrete execution regimes (e.g., “small vs large orders never mix”), then yes — you can hard-freeze bucket equality just like side.
+
+But if you think of them as coarse descriptors and want to see whether small orders link into medium bursts (like partial slicing), then freezing bucket equality would artificially break valid temporal continuity.
+
+
+---
+
+🧩 How to handle it cleanly — two valid options
+
+Option 1: Hard constraint (seed invariant)
+
+If you believe clusters should never cross buckets (e.g. distinct trading modes):
+
+seed_bucket = df.at[idx, 'sizeBucket']
+bucket_mask = df['sizeBucket'].eq(seed_bucket)
+
+cand = df.loc[time_mask & side_mask & bucket_mask]
+
+Add that line to your neighbors() function right under the side_mask logic.
+That way, clusters stay within the same bucket as the seed.
+
+✅ Pros: clean boundaries, no cross-bucket leakage
+⚠️ Cons: can fragment genuinely related clusters if your bucket edges are arbitrary (e.g. 999 999 vs 1 000 001)
+
+
+---
+
+Option 2: Soft constraint (weighted feature)
+
+If you want to allow fuzzy overlap but discourage it, encode the bucket numerically and include it in distance calculation with a small weight, e.g.:
+
+bucket_map = {'small': 0, 'medium': 1, 'large': 2, 'huge': 3}
+df['bucket_enc'] = df['sizeBucket'].map(bucket_map).astype(float)
+
+# inside neighbor distance calc
+x = np.array([x0_qty, x0_price, x0_bucket * 0.1])  # 0.1 scales down importance
+xy = np.column_stack([qtys, prices, buckets * 0.1])
+d = np.linalg.norm(xy - x, axis=1)
+
+Now DBSCAN will prefer to link same-bucket points (distance ≈ 0) but still allow cross-bucket reachability if everything else (time/side) matches tightly.
+
+✅ Pros: captures smooth gradation from small→medium bursts
+⚠️ Cons: less interpretable boundaries
+
+
+---
+
+Option 3 (cleanest in practice): run per-bucket
+
+This is what most quant microstructure papers do — just run clustering independently per bucket:
+
+for (bkt, side, bucket), g in df.groupby(['bucket5','dealSide','sizeBucket']):
+    ...
+
+That’s equivalent to a “seed-invariant” rule for bucket, but implemented at the grouping level rather than inside the expansion loop — simpler, faster, and avoids double logic inside neighbors().
+
+
+---
+
+🧩 Summary table
+
+Strategy	Code change	Behaviour	When to use
+
+Hard constraint (seed invariant)	add bucket_mask = df['sizeBucket']==seed_bucket	Clusters cannot cross buckets	You want strict isolation
+Soft weighted feature	encode bucket numerically with small weight	Mild bucket separation	You want graded continuity
+Per-bucket grouping	outer groupby('sizeBucket') loop	Strict but clean	Most practical + efficient
+
+
+
+---
+
+✅ Recommendation for you
+
+Given your dataset (FX voice/e-system trades), size buckets are regime-like — e.g., small passive vs large block flows — so the cleanest and least confusing solution is:
+
+> 👉 Use Option 3: run ST-DBSCAN independently per size bucket and side.
+
+
+
+That’s equivalent to a bucket seed-invariant rule, but you don’t complicate the neighbor expansion logic or risk inconsistent scaling.
+
+
+---
+
+If you want, I can show the exact few-line modification to your current ST_DBSCAN loop to make it bucket-aware via grouping (and optionally integrate silhouette + Davies–Bouldin per bucket automatically).
+Would you like me to?
