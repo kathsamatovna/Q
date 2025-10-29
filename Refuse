@@ -1,0 +1,253 @@
+Kate, you’re running into three separate things at once. Here’s a clean, surgical fix list you can drop in now, plus why each matters.
+
+
+---
+
+1) Stop the side/time leakage (one-line bug)
+
+In your last screenshot you do this inside the expansion:
+
+# WRONG inside while stack
+seed_time = df_day.at[j, 'startTime']
+seed_side = df_day.at[j, side_col]
+Nj = neighbors(..., seed_time=seed_time, seed_side=seed_side, ...)
+
+That re-seeds on every hop, so the cluster can “walk” in time and flip side.
+Fix: keep the original seed from the starting index idx for the entire cluster.
+
+# BEFORE the while loop
+seed_time = df_day.at[idx, 'startTime']
+seed_side = df_day.at[idx, side_col]
+
+# ... then inside the loop, ALWAYS pass the same seed_time/seed_side:
+Nj = neighbors(df_day, j, eps_space, eps_time_s,
+               seed_time=seed_time, seed_side=seed_side,
+               qty_col=qty_col, price_col=price_col, side_col=side_col,
+               scaler=scaler)
+
+That single change usually fixes most “bad silhouette / crazy DB” symptoms because you stop mixing incompatible points.
+
+
+---
+
+2) Compute quality metrics on the same scaled features
+
+You’re evaluating Silhouette/DB on raw [grossOrdered, priceExecuted]. If magnitudes differ, DB can explode.
+
+Rule: whatever scaler you use for distance, use the same scaling for quality metrics.
+
+def metrics_from_scaled(valid, qty_col='grossOrdered', price_col='priceExecuted', labels_col='cluster', scaler=None):
+    from sklearn.metrics import silhouette_score, davies_bouldin_score
+    if valid[labels_col].nunique() < 2:
+        return np.nan, np.nan
+    X = valid[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+    if scaler is not None:
+        X = scaler.transform(X)
+    return silhouette_score(X, valid[labels_col]), davies_bouldin_score(X, valid[labels_col])
+
+Use this inside your per-slice loop (see §4).
+
+
+---
+
+3) Robust scaler & eps selection (why your scores are bad)
+
+Use RobustScaler per slice (less sensitive to outliers).
+
+Re-pick eps_space from a k-distance elbow after scaling. If eps_space is too large you’ll get one mushy cluster → negative Silhouette and huge DB.
+
+
+Quick elbow (per slice):
+
+from sklearn.neighbors import NearestNeighbors
+
+def elbow_eps(X_scaled, k):
+    nbrs = NearestNeighbors(n_neighbors=k).fit(X_scaled)
+    d = np.sort(nbrs.kneighbors(X_scaled)[0][:, k-1])
+    return np.quantile(d, 0.9)  # heuristic start
+
+
+---
+
+4) Run per size bucket × side × 5-min (and get metrics)
+
+Drop-in driver that (a) fits a scaler per slice, (b) calls your seed-invariant ST-DBSCAN,
+(c) evaluates Silhouette/DB with the same scaler, and (d) makes global-unique cluster IDs.
+
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+
+def run_stdbscan_per_sizebucket(df,
+                                eps_space=0.6,
+                                eps_time_s=300,
+                                min_samples=6,
+                                qty_col='grossOrdered',
+                                price_col='priceExecuted',
+                                side_col='dealSide',
+                                size_bucket_col='sizeBucket',
+                                time_bucket_col='bucket5'):
+    df = df.sort_values('startTime').copy()
+    if time_bucket_col not in df.columns:
+        df[time_bucket_col] = df['startTime'].dt.floor('5min')
+
+    out, metrics, offset = [], [], 0
+    group_keys = [size_bucket_col, side_col, time_bucket_col]
+
+    for (size_bkt, side, tbkt), g in df.groupby(group_keys, sort=False):
+        if len(g) < min_samples:
+            tmp = g.copy(); tmp['cluster'] = -1; out.append(tmp); continue
+
+        X = g[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+        scaler = RobustScaler().fit(X)
+        Xs = scaler.transform(X)
+
+        # (optional) tune eps per slice
+        # eps_space_local = elbow_eps(Xs, k=min_samples)
+        eps_space_local = eps_space
+
+        clustered = ST_DBSCAN(
+            g, eps_space=eps_space_local, eps_time_s=eps_time_s, min_samples=min_samples,
+            qty_col=qty_col, price_col=price_col, side_col=side_col, scaler=scaler
+        )
+
+        pos = clustered['cluster'] > 0
+        clustered.loc[pos, 'cluster'] = clustered.loc[pos, 'cluster'] + offset
+        if pos.any():
+            offset = int(clustered.loc[pos, 'cluster'].max())
+
+        out.append(clustered)
+
+        # quality on SAME scaling
+        valid = clustered[clustered['cluster'] > 0]
+        if valid['cluster'].nunique() >= 2:
+            Xv = valid[[qty_col, price_col]].apply(pd.to_numeric, errors='coerce').fillna(0.0).to_numpy()
+            Xv = scaler.transform(Xv)
+            sil = silhouette_score(Xv, valid['cluster'])
+            db  = davies_bouldin_score(Xv, valid['cluster'])
+        else:
+            sil, db = np.nan, np.nan
+
+        metrics.append({
+            'sizeBucket': size_bkt, 'dealSide': side, 'timeBucket': tbkt,
+            'n_orders': len(g),
+            'n_clusters': int(valid['cluster'].nunique()),
+            'silhouette': sil, 'davies_bouldin': db
+        })
+
+    df_clusters = pd.concat(out).sort_index()
+    quality_table = pd.DataFrame(metrics)
+    return df_clusters, quality_table
+
+Call:
+
+df[['grossOrdered','priceExecuted']] = df[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+df['startTime'] = pd.to_datetime(df['startTime'])
+
+df_clusters, quality = run_stdbscan_per_sizebucket(
+    df, eps_space=0.4, eps_time_s=300, min_samples=8
+)
+
+
+---
+
+5) HMM won’t converge — make it robust
+
+What’s biting you:
+
+covariance singularities (features on wildly different scales / heavy tails),
+
+too many states for your sample length,
+
+NaNs/inf after scaling/logs,
+
+mixing BUY+SELL regimes.
+
+
+Do this:
+
+from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
+
+# build per-cluster features first (duration, total_qty, impact_slope, tempo, side_num)
+# (same as before)
+
+F = cluster_summary[['total_qty','duration_s','impact_slope','tempo']].replace([np.inf,-np.inf], np.nan).fillna(0.0)
+F['log_total_qty'] = np.log1p(F['total_qty'])
+F['log_duration_s'] = np.log1p(F['duration_s'])
+X = F[['log_total_qty','log_duration_s','impact_slope','tempo']].to_numpy()
+
+sc = StandardScaler().fit(X)
+Xs = sc.transform(X)
+
+# try fewer states, diagonal covariance, more iters, tolerance
+for k in [2,3,4]:
+    hmm = GaussianHMM(n_components=k, covariance_type='diag', n_iter=800, tol=1e-3, random_state=0)
+    try:
+        hmm.fit(Xs)
+        _ = hmm.score(Xs)  # ensures finite loglik
+        states = hmm.predict(Xs)
+        print(f"K={k} OK. Transition diag:", np.diag(hmm.transmat_))
+        break
+    except Exception as e:
+        print(f"K={k} failed:", e)
+
+Tips
+
+Run separately per side: cluster_summary[cluster_summary.side=='BUY'].
+
+Clip outliers: F['impact_slope'] = F['impact_slope'].clip(lower=F['impact_slope'].quantile(0.01), upper=F['impact_slope'].quantile(0.99)).
+
+If it still fails, drop the noisiest feature (often impact_slope) and retry.
+
+
+
+---
+
+6) Quick parameter guardrails
+
+Start eps_space small after scaling: 0.3–0.6.
+
+min_samples: 6–15 (higher = stricter).
+
+eps_time_s: true window, 300s if 5-min.
+
+If many slices return 0 or 1 cluster → either increase eps_space slightly or aggregate to 10-min buckets for sparse buckets.
+
+
+
+---
+
+7) Minimal test you can run right now
+
+After fixing the seed bug:
+
+# 1) Run one slice explicitly to sanity-check
+g = df[(df['sizeBucket']=='5–10M') & (df['dealSide']=='BUY')].copy()
+g['bucket5'] = g['startTime'].dt.floor('5min')
+g = g[g['bucket5']==g['bucket5'].min()]                   # pick a single 5-min slice
+scaler = RobustScaler().fit(g[['grossOrdered','priceExecuted']])
+res = ST_DBSCAN(g, eps_space=0.4, eps_time_s=300, min_samples=6,
+                qty_col='grossOrdered', price_col='priceExecuted', side_col='dealSide',
+                scaler=scaler)
+
+print(res['cluster'].value_counts())
+
+If that looks sensible, run the full run_stdbscan_per_sizebucket.
+
+
+---
+
+TL;DR
+
+Bug: you were resetting seed_side/seed_time to j inside the loop → leakage. Keep them fixed to the original seed.
+
+Metrics: compute Silhouette/DB on the same scaled features you used to cluster.
+
+Per-bucket: cluster in (sizeBucket × side × 5-min) slices with their own scaler; give each slice global-unique labels.
+
+HMM: make it robust (covariance_type='diag', fewer states, side-specific, outlier clipping, strong scaling).
+
+
+If anything still misbehaves, paste the exact values you’re using for eps_space / min_samples, and the .describe() of grossOrdered & priceExecuted for one problematic bucket; I’ll calc a concrete eps_space for you.
