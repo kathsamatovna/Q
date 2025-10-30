@@ -1,0 +1,550 @@
+Awesome—let’s rebuild your Hidden Markov Model end-to-end, with every line explained and with guardrails that prevent the “free scalars > samples ⇒ degenerate solution” problem you saw.
+
+Below I assume you already have point-level clustered trades in a DataFrame df_clusters with at least:
+
+cluster (int; >0 are real clusters, −1 noise)
+
+startTime (datetime64[ns])
+
+dealSide (‘BUY’/‘SELL’)
+
+grossOrdered (float)
+
+priceExecuted (float)
+
+optional: sizeBucket (string like '1–5M', …)
+
+
+We’ll aggregate clusters → build robust features → fit side-specific, sequence-aware, regularized Gaussian HMMs → decode regimes → summarize → plot. I’m using only matplotlib for plots.
+
+
+---
+
+0) Why you got the “free scalars” / degeneracy warning
+
+For a Gaussian HMM with K states and d features:
+
+Means: K * d
+
+(Diag) variances: K * d  ← use diag cov to cut params
+
+Start probabilities: K−1  (sum to 1)
+
+Transition matrix: K * (K−1) (each row sums to 1, so K constraints)
+
+
+Total free scalars (diag cov)
+n_params = K*d (means) + K*d (vars) + (K−1) (start) + K*(K−1) (trans)
+
+If your number of observations N is small relative to n_params, the optimizer often:
+
+makes covariances singular,
+
+collapses to sticky states (transition diag ~ 1),
+
+or fails to converge.
+
+
+We’ll cap K based on N and d, use diag covariance, set a minimum variance, and (optionally) fit with sequence lengths so we don’t create fake transitions across days/buckets.
+
+
+---
+
+1) Imports
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from hmmlearn.hmm import GaussianHMM
+
+
+---
+
+2) Build a clean per-cluster feature table
+
+Purpose:
+
+Collapse point-level trades to one row per cluster.
+
+Create robust, low-collinearity features for the HMM.
+
+Handle heavy tails (log / winsorize).
+
+(Optional) split by side later.
+
+
+def build_cluster_summary(df_clusters: pd.DataFrame) -> pd.DataFrame:
+    """
+    From point-level clustered trades, produce one row per cluster with
+    robust features for HMM.
+    """
+    # keep only real clusters
+    g = df_clusters[df_clusters['cluster'] > 0].copy()
+
+    # basic per-cluster aggregates
+    cluster_summary = (
+        g.groupby('cluster')
+         .agg(
+             start_time=('startTime','min'),
+             end_time=('startTime','max'),
+             n_orders=('startTime','size'),
+             total_qty=('grossOrdered','sum'),
+             price_span=('priceExecuted', lambda x: float(np.nanmax(x) - np.nanmin(x))),
+             side=('dealSide','first'),
+         )
+         .reset_index()
+    )
+
+    # duration, tempo
+    cluster_summary['duration_s'] = (
+        cluster_summary['end_time'] - cluster_summary['start_time']
+    ).dt.total_seconds().clip(lower=1.0)
+
+    cluster_summary['tempo'] = cluster_summary['n_orders'] / cluster_summary['duration_s']  # orders/sec
+
+    # heavy tails → log
+    cluster_summary['log_total_qty'] = np.log1p(cluster_summary['total_qty'].clip(lower=0))
+    cluster_summary['log_duration_s'] = np.log1p(cluster_summary['duration_s'])
+
+    # winsorize a couple of spiky rates (1%..99%)
+    for col in ['tempo', 'price_span']:
+        lo, hi = cluster_summary[col].quantile([0.01, 0.99])
+        cluster_summary[col] = cluster_summary[col].clip(lo, hi)
+
+    # sort by time (HMM expects sequential order)
+    cluster_summary = cluster_summary.sort_values('start_time').reset_index(drop=True)
+
+    return cluster_summary
+
+Why these features?
+
+log_total_qty and log_duration_s: tame heavy tails.
+
+tempo: activity rate; less collinear than raw n_orders once you also have duration.
+
+price_span: simple internal “range” proxy for within-cluster volatility / aggressiveness.
+
+
+We don’t feed raw side here; we’ll fit separate HMMs by side to avoid bimodal mixtures.
+
+
+---
+
+3) Assemble the HMM design matrix (X) with safeguards
+
+Purpose:
+
+Select a compact feature set.
+
+Remove zero-variance columns (per side / per bucket this happens).
+
+Standardize to unit scale.
+
+Return the scaler + the names of actually used features.
+
+
+def make_hmm_matrix(cluster_summary: pd.DataFrame,
+                    feature_cols=('log_total_qty','log_duration_s','tempo','price_span')):
+    """
+    Build X and a fitted StandardScaler. Drops zero-variance columns if any.
+    Returns: X (N x d'), scaler, used_cols (list)
+    """
+    X_raw = cluster_summary[list(feature_cols)].replace([np.inf,-np.inf], np.nan).fillna(0.0).to_numpy()
+
+    # drop zero-variance columns (rare but deadly for HMM)
+    std = X_raw.std(axis=0)
+    keep = std > 1e-12
+    used_cols = [c for c, k in zip(feature_cols, keep) if k]
+    X_raw = X_raw[:, keep]
+
+    scaler = StandardScaler().fit(X_raw)
+    X = scaler.transform(X_raw)
+
+    return X, scaler, used_cols
+
+
+---
+
+4) Build sequence lengths (optional but recommended)
+
+If you are mixing multiple natural sequences (e.g., different sizeBuckets or days), the HMM should not assume transitions across those boundaries. We pass lengths= to the fitter/predictor.
+
+I’ll give two options: per-day or per-sizeBucket.
+
+def make_lengths_per_day(cluster_summary: pd.DataFrame):
+    cs = cluster_summary.copy()
+    cs['day'] = cs['start_time'].dt.date
+    lengths = cs.groupby('day').size().to_list()
+    order_index = cs.index.to_numpy()  # already sorted by start_time
+    return lengths, order_index
+
+def make_lengths_per_sizebucket(cluster_summary: pd.DataFrame, df_clusters: pd.DataFrame):
+    """
+    Map each cluster to its dominant sizeBucket (first occurrence),
+    sort by (sizeBucket, start_time), and produce lengths per bucket.
+    """
+    cl2bucket = (
+        df_clusters[df_clusters['cluster']>0]
+        .groupby('cluster')['sizeBucket'].first()
+    )
+    cs = cluster_summary.copy()
+    cs['sizeBucket'] = cs['cluster'].map(cl2bucket)
+    cs = cs.sort_values(['sizeBucket','start_time']).reset_index(drop=True)
+    lengths = cs.groupby('sizeBucket').size().to_list()
+    order_index = cs.index.to_numpy()
+    return lengths, order_index, cs  # return reordered cs if you want to keep alignment
+
+Pick one of the two strategies; per-day is usually simpler.
+
+
+---
+
+5) A safe HMM fitter with BIC model selection
+
+Purpose:
+
+Keep K reasonable relative to N and d to avoid the “free scalars” problem.
+
+Use diag covariance, min_covar floor, and non-degenerate initial transitions.
+
+Optionally fit with lengths=.
+
+
+Heuristics:
+
+Require N >= 8 * K * d (rule-of-thumb; tune if needed).
+
+Cap K to at most 4 unless you have lots of data.
+
+
+def fit_hmm_bic(X, lengths=None, K_min=2, K_max=4, random_state=0):
+    """
+    Fit GaussianHMM models for K in [K_min, K_max] with safety heuristics and
+    pick by BIC. Returns dict: {'model', 'k', 'bic'}.
+    """
+    N, d = X.shape
+    best = None
+
+    for K in range(K_min, K_max+1):
+        # Safety: skip models that would be too parameter-rich for N
+        n_params = K*d + K*d + (K-1) + K*(K-1)
+        if N < max(25, 8*K*d):  # require enough data
+            # print(f"Skip K={K}: N={N} too small for d={d}")
+            continue
+
+        model = GaussianHMM(
+            n_components=K, covariance_type='diag',
+            n_iter=800, tol=1e-3, random_state=random_state
+        )
+        # prevent singular covariances
+        model.min_covar = 1e-5
+
+        # initialize startprob/transmat non-degenerate
+        model.startprob_ = np.full(K, 1.0/K)
+        model.transmat_  = np.full((K,K), 1.0/K)
+        # keep our init for start+trans, let means/vars be learned
+        model.init_params = "mc"
+
+        # Fit
+        model.fit(X, lengths=lengths)
+
+        # Finite log-likelihood check
+        ll = model.score(X, lengths=lengths)
+
+        # BIC
+        bic = -2*ll + n_params*np.log(N)
+
+        if (best is None) or (bic < best['bic']):
+            best = {'model': model, 'k': K, 'bic': bic}
+
+    if best is None:
+        # Fallback: force K=2 with extra regularization if everything got skipped
+        K = 2
+        model = GaussianHMM(n_components=K, covariance_type='diag',
+                            n_iter=800, tol=1e-3, random_state=random_state)
+        model.min_covar = 1e-4
+        model.startprob_ = np.full(K, 1.0/K)
+        model.transmat_  = np.full((K,K), 1.0/K)
+        model.init_params = "mc"
+        model.fit(X, lengths=lengths)
+        best = {'model': model, 'k': K, 'bic': np.nan}
+
+    return best
+
+Why this prevents degeneracy:
+We refuse large K when N is small; we use diag covariance + a variance floor; and we avoid pathological initial transitions.
+
+
+---
+
+6) Full pipeline wrapper (side-specific; with per-day sequences)
+
+Purpose:
+
+Split by side (BUY/SELL).
+
+Build features → X.
+
+Build lengths per day (or use the sizeBucket variant if that’s your preferred split).
+
+Fit HMM via BIC.
+
+Decode states.
+
+Return annotated summaries and the trained model.
+
+
+def hmm_pipeline_for_side(df_clusters: pd.DataFrame,
+                          side: str,
+                          use_sizebucket_sequences=False):
+    """
+    Build, fit, and decode an HMM for a single side ('BUY' or 'SELL').
+    Returns: dict with cluster_summary, X, scaler, used_cols, model, states, lengths.
+    """
+    # Filter to the chosen side
+    side_mask = df_clusters['dealSide'].str.upper().eq(side)
+    df_side = df_clusters[side_mask].copy()
+    if (df_side['cluster'] > 0).sum() < 5:
+        raise ValueError(f"Not enough clusters for side={side}")
+
+    # 1) Per-cluster table
+    cs = build_cluster_summary(df_side)
+
+    # 2) Make X
+    X, scaler, used_cols = make_hmm_matrix(cs)
+
+    # 3) Sequence lengths (choose one strategy)
+    if use_sizebucket_sequences and ('sizeBucket' in df_side.columns):
+        lengths, order_idx, cs_reordered = make_lengths_per_sizebucket(cs, df_side)
+        cs = cs_reordered  # keep alignment with X below
+        X = X[order_idx]   # reorder features to match cs_reordered
+    else:
+        lengths, order_idx = make_lengths_per_day(cs)
+        # cs already sorted by start_time; order_idx is a no-op here but we keep API
+
+    # 4) Fit HMM with BIC
+    best = fit_hmm_bic(X, lengths=lengths, K_min=2, K_max=4, random_state=42)
+    model = best['model']
+
+    # 5) Decode states (regimes)
+    states = model.predict(X, lengths=lengths)
+    cs = cs.copy()
+    cs['regime'] = states
+
+    return {
+        'cluster_summary': cs,
+        'X': X,
+        'scaler': scaler,
+        'used_cols': used_cols,
+        'model': model,
+        'states': states,
+        'lengths': lengths,
+        'side': side
+    }
+
+
+---
+
+7) Run both sides
+
+# Ensure types just once
+df_clusters = df_clusters.copy()
+df_clusters['startTime'] = pd.to_datetime(df_clusters['startTime'])
+df_clusters[['grossOrdered','priceExecuted']] = (
+    df_clusters[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+)
+
+# BUY
+res_buy  = hmm_pipeline_for_side(df_clusters, side='BUY',  use_sizebucket_sequences=False)
+# SELL
+res_sell = hmm_pipeline_for_side(df_clusters, side='SELL', use_sizebucket_sequences=False)
+
+If you prefer per-sizeBucket sequences, set use_sizebucket_sequences=True above (requires sizeBucket).
+
+
+---
+
+8) Inspect model quality (diagnostics)
+
+Purpose:
+
+Check transition matrix isn’t degenerate (all diagonal ~1.0).
+
+Inspect state means (in scaled space); large +/− indicate distinct regimes.
+
+
+def print_hmm_diagnostics(res):
+    m = res['model']; cols = res['used_cols']
+    print(f"Side={res['side']}  K={m.n_components}")
+    print("Transition matrix (rounded):")
+    print(np.round(m.transmat_, 3))
+    print("State means (scaled space):")
+    print(pd.DataFrame(m.means_, columns=cols).round(2))
+    print("State variances (diag):")
+    print(pd.DataFrame(m.covars_, columns=cols).round(2))
+
+print_hmm_diagnostics(res_buy)
+print_hmm_diagnostics(res_sell)
+
+If diagonals are all ~0.98+ and off-diagonals ~0 → reduce K or consider that the process is very sticky.
+
+
+---
+
+9) Merge regimes back to point-level data (optional)
+
+Useful if you want to color the original trades by the cluster regime.
+
+def attach_regimes_to_points(df_clusters: pd.DataFrame, res_dict):
+    cs = res_dict['cluster_summary'][['cluster','regime']].copy()
+    side = res_dict['side'].upper()
+    mask = df_clusters['dealSide'].str.upper().eq(side)
+    df_side = df_clusters[mask].copy()
+    df_side = df_side.merge(cs, on='cluster', how='left')
+    return df_side
+
+df_with_reg_buy  = attach_regimes_to_points(df_clusters, res_buy)
+df_with_reg_sell = attach_regimes_to_points(df_clusters, res_sell)
+
+df_with_regimes = pd.concat([df_with_reg_buy, df_with_reg_sell], ignore_index=True)
+
+
+---
+
+10) Summaries you can trust
+
+def summarize_by_regime(res):
+    cs = res['cluster_summary']
+    s = (
+        cs.groupby('regime')
+          .agg(
+              n_clusters=('cluster','count'),
+              mean_qty=('total_qty','mean'),
+              median_duration_s=('duration_s','median'),
+              mean_price_span=('price_span','mean'),
+              mean_tempo=('tempo','mean'),
+          )
+          .sort_index()
+    )
+    return s
+
+print("BUY regimes:\n", summarize_by_regime(res_buy))
+print("SELL regimes:\n", summarize_by_regime(res_sell))
+
+Interpretation hints:
+
+high qty, short duration, high tempo, large price_span → aggressive sweep.
+
+moderate qty, long duration, low price_span → passive schedule.
+
+
+
+---
+
+11) Plots (pure matplotlib)
+
+(A) Transition matrix heatmap
+
+def plot_transmat(res, title_prefix=""):
+    m = res['model']
+    plt.figure(figsize=(4,3))
+    plt.imshow(m.transmat_, interpolation='nearest')
+    plt.colorbar()
+    plt.title(f"{title_prefix} Transition matrix (K={m.n_components})")
+    plt.xlabel("to state"); plt.ylabel("from state")
+    plt.tight_layout(); plt.show()
+
+plot_transmat(res_buy,  "BUY")
+plot_transmat(res_sell, "SELL")
+
+(B) Timeline of regimes (one point per cluster)
+
+def plot_regime_timeline(res):
+    cs = res['cluster_summary']
+    plt.figure(figsize=(9,3.5))
+    plt.scatter(cs['start_time'], cs['total_qty'], c=cs['regime'], s=30)
+    plt.title(f"{res['side']} – cluster regimes through time")
+    plt.xlabel("Start time"); plt.ylabel("Total qty")
+    plt.tight_layout(); plt.show()
+
+plot_regime_timeline(res_buy)
+plot_regime_timeline(res_sell)
+
+(C) Duration by regime (boxplot)
+
+def plot_duration_box(res):
+    cs = res['cluster_summary']
+    data = [cs.loc[cs['regime']==r, 'duration_s'].to_numpy()
+            for r in sorted(cs['regime'].unique())]
+    plt.figure(figsize=(6,3.5))
+    plt.boxplot(data, labels=[f"S{r}" for r in sorted(cs['regime'].unique())], showfliers=False)
+    plt.ylabel("Duration (s)"); plt.title(f"{res['side']} – duration by regime")
+    plt.tight_layout(); plt.show()
+
+plot_duration_box(res_buy)
+plot_duration_box(res_sell)
+
+(D) State means (bar chart, scaled features)
+
+def plot_state_means(res):
+    m = res['model']; cols = res['used_cols']
+    means = pd.DataFrame(m.means_, columns=cols).T  # shape d x K
+    ax = means.plot(kind='bar', figsize=(8,3.5))
+    ax.set_title(f"{res['side']} – state means (scaled features)")
+    ax.set_ylabel("Z-score")
+    plt.tight_layout(); plt.show()
+
+plot_state_means(res_buy)
+plot_state_means(res_sell)
+
+
+---
+
+12) Most common pitfalls (and how this code avoids them)
+
+1. Degenerate solutions
+— We cap K by N and d, use diag covariance + min_covar, and initialize transitions sensibly.
+
+
+2. Bimodal features (BUY/SELL mixing)
+— We fit separate HMMs per side.
+
+
+3. Fake transitions across days/buckets
+— We pass lengths to tell the model where sequences break.
+
+
+4. Singular covariances
+— We log heavy tails, winsorize, drop zero-variance cols, and standardize.
+
+
+5. Collinearity
+— We avoid feeding both n_orders and tempo; keep tempo with log_duration.
+
+
+6. “Free scalars > samples” warnings
+— Enforced data-to-parameter ratio via N >= 8*K*d guard + small K (≤4 default).
+
+
+
+
+---
+
+TL;DR (what to run)
+
+1. Paste sections 1 → 11 in order.
+
+
+2. Run the “BUY” and “SELL” pipelines.
+
+
+3. Check transitions, state means, and the plots.
+
+
+4. If everything is sticky (diag ~ 0.99), reduce K or aggregate sequences (e.g., per 10-min buckets) to increase N.
+
+
+
+If you paste a small cluster_summary.head(12) with the four feature columns, I can suggest an exact K and explain the regimes you’re seeing numerically.
