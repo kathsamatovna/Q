@@ -1,0 +1,231 @@
+Got it—I can see why the HMM (“mark over model” 😅) is behaving oddly from your screenshots. The symptoms (nonsense states, transition matrix near-identity, failures to converge) usually come from a few specific gotchas. Here’s a tight fix list you can apply now, with drop-in code.
+
+
+---
+
+0) What’s going wrong (most likely)
+
+1. Re-seeding in ST-DBSCAN (you already fixed this, but confirm): inside the while loop you must pass the original seed_time/seed_side, not j’s. Leakage produces junk clusters → junk HMM input.
+
+
+2. Feature geometry for HMM:
+
+Heavy tails (total_qty, duration, tempo) → singular covariances.
+
+Collinearity (tempo ≈ n_orders/duration, plus log_duration) → ill-conditioned.
+
+Mixing BUY/SELL in one model while also feeding side_num → bimodality the Gaussian can’t capture well.
+
+
+
+3. Too few observations for K states:
+
+Rule of thumb: N > 10*K*d. If you have 12 clusters and K=3, d=5 → underdetermined.
+
+
+
+4. Multiple sequences without lengths:
+
+If you concatenate clusters from distinct days/buckets, HMM assumes one continuous chain and tries to learn cross-day transitions that don’t exist.
+
+
+
+5. Zero/near-zero variance columns or constant features in a bucket → singularities.
+
+
+
+
+---
+
+1) Build a clean, robust HMM feature set
+
+Use per-cluster features, winsorize, de-collinearize, side-split.
+
+import numpy as np, pandas as pd
+from sklearn.preprocessing import StandardScaler
+
+# df_clusters: point-level; build per-cluster summary first
+g = df_clusters[df_clusters['cluster'] > 0].copy()
+
+cluster_summary = (
+    g.groupby('cluster')
+     .agg(start_time=('startTime','min'),
+          end_time=('startTime','max'),
+          n_orders=('startTime','size'),
+          total_qty=('grossOrdered','sum'),
+          price_span=('priceExecuted', lambda x: float(np.nanmax(x)-np.nanmin(x))),
+          side=('dealSide','first'))
+     .reset_index()
+)
+cluster_summary['duration_s'] = (cluster_summary['end_time'] - cluster_summary['start_time']).dt.total_seconds().clip(lower=1.0)
+cluster_summary['tempo'] = cluster_summary['n_orders'] / cluster_summary['duration_s']  # orders/sec
+
+# --- robustify / de-collinearize ---
+# 1) Log heavy tails
+cluster_summary['log_total_qty'] = np.log1p(cluster_summary['total_qty'].clip(lower=0))
+cluster_summary['log_duration_s'] = np.log1p(cluster_summary['duration_s'])
+
+# 2) Replace tempo with a less collinear rate (optional):
+#    keep tempo OR use n_orders and log_duration, not both. Let's KEEP tempo and DROP n_orders.
+# 3) Winsorize extremes (1–99%)
+for col in ['tempo', 'price_span']:
+    lo, hi = cluster_summary[col].quantile([0.01, 0.99])
+    cluster_summary[col] = cluster_summary[col].clip(lo, hi)
+
+# 4) Choose final feature matrix (small & orthogonal-ish)
+feat_cols = ['log_total_qty','log_duration_s','tempo','price_span']
+X_raw = cluster_summary[feat_cols].replace([np.inf,-np.inf], np.nan).fillna(0.0).to_numpy()
+
+# Remove zero-variance columns (can happen per bucket)
+keep = X_raw.std(axis=0) > 1e-12
+feat_cols = [c for c,k in zip(feat_cols, keep) if k]
+X_raw = X_raw[:, keep]
+
+scaler = StandardScaler().fit(X_raw)
+X = scaler.transform(X_raw)
+
+# Sort by time (single sequence in order)
+cluster_summary = cluster_summary.sort_values('start_time').reset_index(drop=True)
+
+Split by side (recommended)
+
+def subset_side(cs, X, side):
+    m = cs['side'].str.upper().eq(side)
+    return cs.loc[m].reset_index(drop=True), X[m.values]
+
+cs_buy, X_buy = subset_side(cluster_summary, X, 'BUY')
+cs_sell, X_sell = subset_side(cluster_summary, X, 'SELL')
+
+
+---
+
+2) Handle multiple sequences (days / size buckets)
+
+If you are concatenating clusters from different size buckets or days, pass lengths= so HMM knows where sequences break.
+
+Example (per side, per sizeBucket):
+
+def make_sequences_per_bucket(cs, X, df_clusters):
+    # map cluster -> sizeBucket (take mode/first)
+    cl2bkt = (df_clusters[df_clusters['cluster']>0]
+              .groupby('cluster')['sizeBucket'].first())
+    cs = cs.copy()
+    cs['sizeBucket'] = cs['cluster'].map(cl2bkt)
+    cs = cs.sort_values(['sizeBucket','start_time']).reset_index(drop=True)
+
+    # lengths for hmmlearn
+    lengths = cs.groupby('sizeBucket').size().to_list()
+    return cs, X[cs.index.to_numpy()], lengths
+
+csb_buy, Xb_buy, lens_buy = make_sequences_per_bucket(cs_buy, X_buy, df_clusters)
+
+If you don’t want per-bucket sequences, at least break per day:
+
+cs_buy['day'] = cs_buy['start_time'].dt.date
+lengths_buy = cs_buy.groupby('day').size().to_list()
+
+Then pass lengths=lengths_buy to .fit() and .score().
+
+
+---
+
+3) Fit a robust HMM (fewer states, diag cov, floor on covariance)
+
+from hmmlearn.hmm import GaussianHMM
+import numpy as np
+
+def fit_hmm(X, lengths=None, K_max=4, random_state=0):
+    best = None
+    N, d = X.shape
+    for k in range(2, min(K_max, max(2, N//5)) + 1):  # keep k sensible vs N
+        model = GaussianHMM(n_components=k, covariance_type='diag',
+                            n_iter=800, tol=1e-3, random_state=random_state)
+        # safety: minimum variance
+        model.min_covar = 1e-5  # attribute exists in hmmlearn
+        # balanced initial transitions to avoid sticky-1.0 diagonals at start
+        model.startprob_ = np.full(k, 1.0/k)
+        model.transmat_  = np.full((k,k), 1.0/k)
+        model.init_params = "mc"  # keep our startprob_/transmat_ fixed on init
+
+        model.fit(X, lengths=lengths)
+        ll = model.score(X, lengths=lengths)
+
+        # crude BIC
+        n_params = k*d + k*d + k + k*(k-1)  # means + diag vars + start + trans (diag cov)
+        bic = -2*ll + n_params*np.log(N)
+        if (best is None) or (bic < best['bic']):
+            best = {'model': model, 'bic': bic, 'k': k}
+    return best
+
+best_buy = fit_hmm(Xb_buy, lengths=lens_buy if len(lens_buy)>1 else None, K_max=4)
+hmm_buy  = best_buy['model']
+states_buy = hmm_buy.predict(Xb_buy, lengths=lens_buy if len(lens_buy)>1 else None)
+
+Why these tweaks help
+
+covariance_type='diag' and min_covar prevent singular matrices.
+
+Fixing init startprob_/transmat_ avoids degenerate “all mass on one state” starts.
+
+Using lengths respects sequence breaks (no fake transitions across days/buckets).
+
+Keeping K small vs. N prevents overfitting (transition diagonal ≈ 1.0 is a classic sign of too many states or not enough data).
+
+
+
+---
+
+4) Quick sanity prints
+
+import pandas as pd
+print("K:", hmm_buy.n_components)
+print("Transition diag:", np.diag(hmm_buy.transmat_).round(3))
+print(pd.DataFrame(hmm_buy.means_, columns=feat_cols).round(2))
+
+If the transition diagonal entries are all ~0.99 with tiny off-diagonals, you still have too many states or too few observations. Drop K by 1.
+
+If a row of means is almost identical to another → states not identifiable; reduce features or K.
+
+
+
+---
+
+5) Attach regimes back to clusters
+
+csb_buy = csb_buy.copy()
+csb_buy['regime'] = states_buy
+df_reg = csb_buy[['cluster','regime']]
+
+df_clusters = df_clusters.merge(df_reg, on='cluster', how='left')
+
+
+---
+
+6) Minimal checklist (do these once)
+
+✔️ ST-DBSCAN uses fixed seed_time/seed_side in every expansion call.
+
+✔️ Compute Silhouette/DB on the same scaled features used to cluster.
+
+✔️ Build HMM features that are log-scaled, winsorized, and not collinear.
+
+✔️ Split by side (or fit two HMMs).
+
+✔️ Pass lengths if your data has natural breaks (days or size buckets).
+
+✔️ Use diag cov, min_covar, small K (2–3) first.
+
+
+
+---
+
+If you paste the sections above in order (feature build → side split → sequences/lengths → robust HMM fit), your model should converge and produce interpretable regimes. If it still looks off, send me:
+
+number of clusters per side,
+
+a cluster_summary[feat_cols].describe(),
+
+and the printed transition matrix.
+
+
+I’ll tell you exactly which feature/K is tripping it.
