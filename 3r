@@ -1,0 +1,154 @@
+Excellent question — this is a really nice point to focus on now that your ST-DBSCAN → HMM chain is solid.
+Let’s fix the plotting error first, then I’ll show you how to compute per-cluster slippage metrics correctly and interpret them.
+
+
+---
+
+🧩 1. The plotting error
+
+Your error:
+
+AttributeError: numpy.ndarray object has no attribute 'plot'
+
+comes from this line:
+
+ax.plot(impact_metrics['grossExecuted'], impact_metrics['ml_slippage'])
+
+because plt.subplots() returns a tuple (fig, ax), but you used fig, axs = plt.subplots() incorrectly or your variables got swapped.
+
+✅ Fix:
+
+fig, ax = plt.subplots(figsize=(6,4))
+ax.plot(impact_metrics['grossExecuted'], impact_metrics['ml_slippage'], 'o', label='Mean slippage')
+ax.set_xlabel('Gross Executed')
+ax.set_ylabel('Mean slippage')
+ax.legend()
+plt.tight_layout(); plt.show()
+
+If you want multiple lines on one figure:
+
+fig, ax = plt.subplots(figsize=(6,4))
+ax.plot(impact_metrics['grossExecuted'], impact_metrics['ml_slippage'], 'o-', label='Mean slippage')
+ax.plot(impact_metrics['grossExecuted'], impact_metrics['mid_fillpx'], 's-', label='Mid fill %')
+ax.plot(impact_metrics['grossExecuted'], impact_metrics['sec_impact'], '^-', label='Secondary impact')
+ax.set_xlabel('Gross Executed')
+ax.legend()
+plt.tight_layout(); plt.show()
+
+
+---
+
+🧭 2. Computing per-cluster slippage metrics
+
+You already aggregate by cluster in your cell:
+
+impact_metrics = (
+    st_outliers.groupby('cluster')
+    .agg(
+        start_time=('startTime','min'),
+        end_time=('startTime','max'),
+        n_orders=('startTime','size'),
+        total_qty=('grossOrdered','sum'),
+        avg_qty=('grossOrdered','mean'),
+        mm_slippage=('midImpact','mean'),
+        price_span=('priceExecuted', lambda x: float(np.nanmax(x)-np.nanmin(x))),
+        side=('dealSide','first'),
+        sec_impact=('secImpact','mean'),
+        mid_fillpx=('midSlippageToPx','mean'),
+        sel_impact=('selImpact','mean')
+    )
+    .reset_index()
+)
+
+That’s fine.
+But check your definitions of the raw slippage columns before aggregation — otherwise your per-cluster means won’t mean anything:
+
+metric	definition	physical meaning
+
+mid_slippage	(exec_px − mid_px) / mid_px	instantaneous deviation from mid (price impact)
+sec_impact	(mid_px_t+Δt − mid_px_t0)/mid_px_t0	secondary market move after trade burst
+mid_fillpx	(avg_fill_px − mid_px_start)/mid_px_start	realized fill advantage/disadvantage
+sel_impact	optional second-order residual	diagnostic
+
+
+Compute them once at order level before the .groupby('cluster'):
+
+st_outliers['mid_slippage'] = (
+    (st_outliers['priceExecuted'] - st_outliers['midPrice']) / st_outliers['midPrice']
+)
+st_outliers['sec_impact'] = (
+    (st_outliers['midPriceAfter'] - st_outliers['midPrice']) / st_outliers['midPrice']
+)
+st_outliers['mid_fillpx'] = (
+    (st_outliers['fillPrice'] - st_outliers['midPrice']) / st_outliers['midPrice']
+)
+
+Then your .agg() block averages them cluster-wise.
+
+
+---
+
+⚙️ 3. Interpret the outputs
+
+pattern	interpretation
+
+Positive mean slippage (BUY)	trader executed above mid → aggressive liquidity taking
+Negative mean slippage (SELL)	sold below mid → aggressive sell
+**Low	slippage
+High mid_fillpx correlation with total_qty	larger clusters pay worse prices (volume–impact curve)
+
+
+Quick scatter diagnostics:
+
+import matplotlib.pyplot as plt
+
+fig, axs = plt.subplots(1,2, figsize=(10,4))
+
+axs[0].scatter(impact_metrics['total_qty'], impact_metrics['mm_slippage'], c='tab:blue')
+axs[0].set_xlabel('Total qty'); axs[0].set_ylabel('Mean mid slippage')
+axs[0].set_title('Immediate impact vs cluster size')
+
+axs[1].scatter(impact_metrics['total_qty'], impact_metrics['sec_impact'], c='tab:orange')
+axs[1].set_xlabel('Total qty'); axs[1].set_ylabel('Secondary impact')
+axs[1].set_title('Post-trade impact vs cluster size')
+
+plt.tight_layout(); plt.show()
+
+If you see an upward slope → size–impact relation (expected in realistic market data).
+Flat slope → likely internalization / voice orders with minimal footprint.
+
+
+---
+
+🧠 4. Optional deeper analysis
+
+method	what it tells you
+
+sns.lmplot(x='total_qty', y='mm_slippage', hue='dealSide')	regression of impact by side
+impact_metrics.groupby('dealSide')['mm_slippage'].describe()	asymmetry between buy/sell aggressiveness
+np.corrcoef(impact_metrics[['mm_slippage','sec_impact','mid_fillpx']].T)	correlation structure between impact types
+cluster these 3 metrics again	separate “impact regimes” (pass into HMM next)
+
+
+
+---
+
+✅ Summary
+
+1. Fix plot call — use fig, ax = plt.subplots() and ax.plot(...).
+
+
+2. Compute per-order slippage before aggregation.
+
+
+3. Group by cluster, aggregate slippage & impact metrics.
+
+
+4. Scatter vs total_qty or cluster duration to inspect impact curves.
+
+
+5. Feed those per-cluster slippage summaries into your HMM for behavioural regimes (optional).
+
+
+
+If you show me your current column names (st_outliers.columns), I can give you a ready-made .agg() dictionary that computes all per-cluster slippage/impact measures cleanly in one go. Would you like that?
