@@ -1,0 +1,206 @@
+Certainly. Below is a fully written and professionally commented explanation of the Hidden Markov Model (HMM) using hmmlearn, showing exactly what each part of the code does, why it’s needed, and how to interpret it.
+
+The example is self-contained and uses synthetic data for clarity, but the structure is identical to how you would use it on your cluster-level trading features.
+
+
+---
+
+1. Conceptual overview
+
+An HMM models a time-ordered process where:
+
+There is a hidden (unobserved) state variable  that evolves according to a Markov chain.
+
+At each time , an observation  is drawn from a probability distribution determined by the current hidden state.
+
+
+Mathematically:
+
+P(S_t | S_{t-1}) = A_{S_{t-1}, S_t}
+
+P(X_t | S_t) \sim \mathcal{N}(\mu_{S_t}, \Sigma_{S_t}) 
+
+Here  is the transition matrix, and each state has its own Gaussian parameters .
+
+In your case:
+
+ = feature vector describing each cluster (e.g. log quantity, duration, tempo, price span)
+
+ = latent trading “regime” (e.g. aggressive, passive)
+
+
+
+---
+
+2. Code demonstration
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import StandardScaler
+
+2.1 Generate or prepare input features
+
+Each row of X corresponds to one time step (or one cluster).
+Here we simulate data from two regimes for demonstration.
+
+# Simulated data: two behavioral regimes
+np.random.seed(0)
+n_samples = 200
+# regime 0: slow, small
+X0 = np.column_stack([
+    np.random.normal(0.0, 0.3, 100),   # log qty
+    np.random.normal(0.0, 0.2, 100)    # tempo
+])
+# regime 1: fast, large
+X1 = np.column_stack([
+    np.random.normal(2.0, 0.4, 100),
+    np.random.normal(1.5, 0.3, 100)
+])
+X = np.vstack([X0, X1])
+
+scaler = StandardScaler().fit(X)
+X_scaled = scaler.transform(X)
+
+If you were using real cluster summaries, X would come from your per-cluster features, e.g.:
+
+X = cluster_summary[['log_total_qty','log_duration_s','tempo','price_span']].to_numpy()
+X_scaled = StandardScaler().fit_transform(X)
+
+
+---
+
+2.2 Fit the Gaussian HMM
+
+# Two hidden regimes
+model = GaussianHMM(
+    n_components=2,             # number of hidden states
+    covariance_type='diag',     # assume features are independent
+    n_iter=500,                 # maximum EM iterations
+    tol=1e-3,                   # convergence tolerance
+    random_state=42
+)
+
+model.fit(X_scaled)
+
+Key parameters
+
+n_components: number of hidden states 
+
+covariance_type:
+
+'full' → each state has full covariance matrix
+
+'diag' → diagonal covariance (simpler, fewer parameters)
+
+'spherical' → same variance in all feature directions (for small data)
+
+
+The model is estimated using the Baum–Welch algorithm, an Expectation–Maximization (EM) method that alternates between:
+
+1. inferring state probabilities,
+
+
+2. updating means, variances, and transition probabilities.
+
+
+
+
+
+---
+
+2.3 Inspect the fitted parameters
+
+print("Transition matrix (A):")
+print(np.round(model.transmat_, 3))
+
+print("\nState means (μ):")
+print(pd.DataFrame(model.means_, columns=['log_qty','tempo']).round(2))
+
+print("\nState variances (Σ diagonal):")
+print(pd.DataFrame(model.covars_, columns=['var_log_qty','var_tempo']).round(2))
+
+transmat_: probability of moving from state i to j.
+A large diagonal means the process tends to remain in the same regime (persistence).
+
+means_: the center of each Gaussian emission.
+
+covars_: how dispersed each state’s observations are.
+
+
+
+---
+
+2.4 Decode the most likely hidden regime sequence
+
+# Predict the most probable regime (Viterbi path)
+states = model.predict(X_scaled)
+
+plt.figure(figsize=(8,3))
+plt.plot(states, drawstyle='steps-mid')
+plt.title("Inferred hidden regimes")
+plt.xlabel("Time index (t)")
+plt.ylabel("Regime")
+plt.show()
+
+Each integer value (0 or 1 here) is the inferred latent state for that time step.
+
+
+---
+
+2.5 Visualize in feature space
+
+plt.figure(figsize=(6,5))
+plt.scatter(X_scaled[:,0], X_scaled[:,1], c=states, cmap='coolwarm', s=20)
+plt.xlabel('log_qty (scaled)')
+plt.ylabel('tempo (scaled)')
+plt.title('Clusters in feature space colored by inferred regime')
+plt.tight_layout()
+plt.show()
+
+Points of different colors correspond to clusters assigned to different regimes.
+
+
+---
+
+3. Interpretation
+
+Output	Meaning
+
+Transition matrix	How often you remain in or switch between regimes. High diagonal values (≈0.9) indicate persistence.
+Means / Variances	The characteristic behavior of each regime in terms of your features.
+Predicted states	The timeline of regime switches. You can overlay these on trade time to see when the trader shifts behavior.
+Covariance type	Determines model complexity: 'diag' for moderate data, 'spherical' for few samples.
+
+
+
+---
+
+4. Practical rules
+
+1. Data size: For stable estimation, you need roughly
+
+where N = number of observations (clusters),
+K = states, d = features.
+
+
+2. Small sample: Use 'spherical' covariance or fix the transition matrix.
+
+
+3. Standardize features before fitting.
+
+
+4. Interpretation: Identify each regime by its feature means:
+
+high log_total_qty, high tempo → aggressive execution,
+
+low log_total_qty, long duration_s → passive / resting.
+
+
+
+
+
+---
+
+This code and explanation correspond exactly to what your larger pipeline does on cluster summaries; the difference is simply that your X comes from real per-cluster statistics rather than synthetic data.
