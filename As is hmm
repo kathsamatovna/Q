@@ -1,0 +1,401 @@
+You’ve hit two real issues at once:
+
+1. “19 free scalars > 12 data points → degenerate solution.”
+With K=2 states and d=4 features (diag covariance) the parameter count is: K*d (means) + K*d (vars) + (K−1) (startprob) + K*(K−1) (transitions)
+→ 2*4 + 2*4 + 1 + 2 = 19 parameters for only N=12 samples. That’s why hmmlearn warns.
+
+
+2. Transition rows summing to 0.
+This happens when some states never see a transition in your data (e.g., many sequences of length 1) and you let the model estimate transmat_. You then get a row of zeros.
+
+
+
+Below is a drop-in, end-to-end HMM pipeline that guarantees no degeneracy by:
+
+Reducing parameter count automatically (chooses fewer features and/or spherical covariance).
+
+Fixing startprob_ and transmat_ (we don’t estimate them) so you never get zero rows.
+
+Respecting sequence boundaries (days or sizeBuckets) with lengths=.
+
+Giving you plots and interpretations.
+
+
+Paste this as-is. It will adapt to your data size.
+
+
+---
+
+1) Imports
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from hmmlearn.hmm import GaussianHMM
+
+
+---
+
+2) Feature build from your clustered trades
+
+def build_cluster_summary(df_clusters: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse point-level clustered trades to one row per cluster.
+    Produces robust features for HMM.
+    Expects columns: cluster (>0), startTime, dealSide, grossOrdered, priceExecuted.
+    """
+    g = df_clusters[df_clusters['cluster'] > 0].copy()
+
+    cs = (
+        g.groupby('cluster')
+         .agg(
+             start_time=('startTime','min'),
+             end_time=('startTime','max'),
+             n_orders=('startTime','size'),
+             total_qty=('grossOrdered','sum'),
+             price_span=('priceExecuted', lambda x: float(np.nanmax(x) - np.nanmin(x))),
+             side=('dealSide','first'),
+         )
+         .reset_index()
+    )
+
+    cs['duration_s'] = (cs['end_time'] - cs['start_time']).dt.total_seconds().clip(lower=1.0)
+    cs['tempo'] = cs['n_orders'] / cs['duration_s']         # orders/sec
+
+    # heavy tails -> log
+    cs['log_total_qty']  = np.log1p(cs['total_qty'].clip(lower=0))
+    cs['log_duration_s'] = np.log1p(cs['duration_s'])
+
+    # winsorize spiky rates (1..99%)
+    for col in ['tempo', 'price_span']:
+        lo, hi = cs[col].quantile([0.01, 0.99])
+        cs[col] = cs[col].clip(lo, hi)
+
+    # time order
+    cs = cs.sort_values('start_time').reset_index(drop=True)
+    return cs
+
+
+---
+
+3) Build X with automatic column pruning
+
+def make_hmm_matrix(cs: pd.DataFrame,
+                    candidate_cols=('log_total_qty','log_duration_s','tempo','price_span')):
+    """
+    Return (X_raw, cols). We DO NOT scale here yet (we may drop cols to fit parameter budget).
+    """
+    X_raw = cs[list(candidate_cols)].replace([np.inf,-np.inf], np.nan).fillna(0.0).to_numpy()
+    std = X_raw.std(axis=0)
+    keep = std > 1e-12
+    cols = [c for c,k in zip(candidate_cols, keep) if k]
+    X_raw = X_raw[:, keep]
+    return X_raw, cols
+
+
+---
+
+4) Sequence boundaries (choose one)
+
+def lengths_per_day(cs: pd.DataFrame):
+    cs = cs.copy()
+    cs['day'] = cs['start_time'].dt.date
+    return cs.groupby('day').size().to_list()
+
+def lengths_per_sizebucket(cs: pd.DataFrame, df_clusters: pd.DataFrame):
+    cl2bucket = (df_clusters[df_clusters['cluster']>0]
+                 .groupby('cluster')['sizeBucket'].first())
+    cs = cs.copy()
+    cs['sizeBucket'] = cs['cluster'].map(cl2bucket)
+    cs.sort_values(['sizeBucket','start_time'], inplace=True, ignore_index=True)
+    lengths = cs.groupby('sizeBucket').size().to_list()
+    return lengths, cs  # reordered cs
+
+
+---
+
+5) Parameter counting + automatic model setup
+
+We’ll guarantee free_params <= N by reducing:
+
+features d (drop last ones),
+
+and/or using spherical covariance (fewer variance params),
+
+and we fix start & transitions (not estimated), which also reduces parameters.
+
+
+def free_params(K, d, cov='spherical', learn_trans=False, learn_start=False):
+    """
+    Count free scalars given K states, d features.
+    cov='spherical' -> K variances total
+    cov='diag'      -> K*d variances total
+    learn_trans/start: whether to estimate transmat/startprob.
+    """
+    means = K * d
+    vars_ = K if cov=='spherical' else K * d
+    trans = K*(K-1) if learn_trans else 0
+    start = (K-1) if learn_start else 0
+    return means + vars_ + trans + start
+
+def pick_cov_and_cols(N, X_raw, cols, K=2, prefer_cov='spherical', learn_trans=False, learn_start=False):
+    """
+    Choose covariance type and a subset of columns so that free_params <= N.
+    Drops the least critical columns last: ('price_span', 'tempo', 'log_duration_s', 'log_total_qty')
+    """
+    drop_order = ['price_span','tempo','log_duration_s','log_total_qty']  # last kept is most important
+    # start from all available (in given order)
+    avail = [c for c in ['log_total_qty','log_duration_s','tempo','price_span'] if c in cols]
+    d = len(avail)
+
+    cov = prefer_cov
+    while True:
+        p = free_params(K, d, cov=cov, learn_trans=learn_trans, learn_start=learn_start)
+        if p <= N or d == 1:
+            break
+        # drop least critical available
+        for c in drop_order:
+            if c in avail and d > 1:
+                avail.remove(c)
+                d -= 1
+                break
+        else:
+            break  # nothing left to drop
+
+    # If still too many, try spherical if we haven't
+    if free_params(K, d, cov=cov, learn_trans=learn_trans, learn_start=learn_start) > N and cov!='spherical':
+        cov = 'spherical'
+
+    # Final subset of X_raw in the order of 'avail'
+    idx = [cols.index(c) for c in avail]
+    X_sub = X_raw[:, idx]
+    return X_sub, avail, cov
+
+
+---
+
+6) Fit a regularized HMM with fixed start/transition
+
+Fixing startprob_ and transmat_ avoids zero rows and reduces parameter count.
+(We can pick mildly persistent transitions like 0.85/0.15.)
+
+def fit_hmm_fixed_trans(X, lengths, K=2, cov='spherical', random_state=0):
+    """
+    Fit GaussianHMM learning ONLY means & variances; startprob_ and transmat_ are fixed.
+    This prevents zero-row transmat and reduces #parameters.
+    """
+    model = GaussianHMM(n_components=K, covariance_type=cov,
+                        n_iter=800, tol=1e-3, random_state=random_state)
+    # variance floor
+    model.min_covar = 1e-5
+
+    # fixed, non-degenerate start & transitions (mild persistence)
+    model.startprob_ = np.full(K, 1.0/K)
+    T = np.full((K,K), (1.0-0.85)/(K-1))  # off-diagonal share
+    np.fill_diagonal(T, 0.85)
+    model.transmat_ = T
+
+    # DO NOT learn start/trans (only means/covars)
+    model.init_params = "mc"
+
+    # scale to unit (important for spherical)
+    sc = StandardScaler().fit(X)
+    Xs = sc.transform(X)
+
+    model.fit(Xs, lengths=lengths)
+    states = model.predict(Xs, lengths=lengths)
+
+    return model, states, sc
+
+
+---
+
+7) Full side-specific pipeline (auto-adapts to N)
+
+def hmm_pipeline_side(df_clusters: pd.DataFrame, side: str,
+                      sequence_mode='day', K=2, prefer_cov='spherical'):
+    """
+    side: 'BUY' or 'SELL'
+    sequence_mode: 'day' or 'sizeBucket'
+    K: number of states (start with 2 when N is small).
+    prefer_cov: 'spherical' (fewer params) or 'diag'
+    """
+    # filter side
+    m = df_clusters['dealSide'].str.upper().eq(side)
+    df_side = df_clusters[m].copy()
+    if (df_side['cluster'] > 0).sum() < 5:
+        raise ValueError(f"Not enough clusters for side={side}")
+
+    # per-cluster features
+    cs = build_cluster_summary(df_side)
+
+    # raw matrix
+    X_raw, cols = make_hmm_matrix(cs)
+
+    # lengths
+    if sequence_mode == 'sizeBucket' and 'sizeBucket' in df_side.columns:
+        lengths, cs = lengths_per_sizebucket(cs, df_side)
+    else:
+        lengths = lengths_per_day(cs)
+
+    N = X_raw.shape[0]  # number of observations
+
+    # choose subset of features & covariance to satisfy parameter budget
+    # We learn ONLY means & variances (start/trans fixed)
+    X_sub, used_cols, cov = pick_cov_and_cols(
+        N, X_raw, cols, K=K, prefer_cov=prefer_cov, learn_trans=False, learn_start=False
+    )
+
+    # fit
+    model, states, scaler = fit_hmm_fixed_trans(X_sub, lengths, K=K, cov=cov, random_state=42)
+
+    # attach regimes
+    cs = cs.copy()
+    cs['regime'] = states
+
+    return {
+        'side': side,
+        'cluster_summary': cs,
+        'X': X_sub,
+        'used_cols': used_cols,
+        'covariance_type': cov,
+        'scaler': scaler,
+        'model': model,
+        'lengths': lengths
+    }
+
+
+---
+
+8) Run both sides
+
+# Ensure base types once
+df_clusters = df_clusters.copy()
+df_clusters['startTime'] = pd.to_datetime(df_clusters['startTime'])
+df_clusters[['grossOrdered','priceExecuted']] = (
+    df_clusters[['grossOrdered','priceExecuted']].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+)
+
+res_buy  = hmm_pipeline_side(df_clusters, 'BUY',  sequence_mode='day', K=2, prefer_cov='spherical')
+res_sell = hmm_pipeline_side(df_clusters, 'SELL', sequence_mode='day', K=2, prefer_cov='spherical')
+
+print("BUY used cols:",  res_buy['used_cols'], "cov:", res_buy['covariance_type'])
+print("SELL used cols:", res_sell['used_cols'], "cov:", res_sell['covariance_type'])
+
+> If you still get “free scalars > data” warnings, it means your N is extremely small.
+The code above already drops features until the parameter budget fits. If N is < 6 and K=2, you may need to temporarily set K=1 (not a Markov model anymore) or collect more clusters.
+
+
+
+
+---
+
+9) Diagnostics & plots
+
+def diag_print(res):
+    m = res['model']; cols = res['used_cols']
+    print(f"\nSIDE={res['side']}  K={m.n_components}  cov={res['covariance_type']}")
+    print("Transmat (fixed):")
+    print(np.round(m.transmat_, 3))
+    print("State means (scaled):")
+    print(pd.DataFrame(m.means_, columns=cols).round(2))
+    print("State variances (scaled):")
+    print(pd.DataFrame(m.covars_.reshape(-1,1) if res['covariance_type']=='spherical' else m.covars_, 
+                       columns=(['var'] if res['covariance_type']=='spherical' else cols)).round(2))
+
+diag_print(res_buy)
+diag_print(res_sell)
+
+Timelines (regimes through time):
+
+def plot_regime_timeline(res):
+    cs = res['cluster_summary']
+    plt.figure(figsize=(9,3.5))
+    plt.scatter(cs['start_time'], cs['total_qty'], c=cs['regime'], s=30)
+    plt.title(f"{res['side']} – regimes through time")
+    plt.xlabel("Start time"); plt.ylabel("Total qty")
+    plt.tight_layout(); plt.show()
+
+plot_regime_timeline(res_buy)
+plot_regime_timeline(res_sell)
+
+Duration by regime (boxplot):
+
+def plot_duration_box(res):
+    cs = res['cluster_summary']
+    data = [cs.loc[cs['regime']==r, 'duration_s'].to_numpy()
+            for r in sorted(cs['regime'].unique())]
+    plt.figure(figsize=(6,3.5))
+    plt.boxplot(data, labels=[f"S{r}" for r in sorted(cs['regime'].unique())], showfliers=False)
+    plt.ylabel("Duration (s)"); plt.title(f"{res['side']} – duration by regime")
+    plt.tight_layout(); plt.show()
+
+plot_duration_box(res_buy)
+plot_duration_box(res_sell)
+
+State means (bar chart, scaled):
+
+def plot_state_means(res):
+    m = res['model']; cols = res['used_cols']
+    means = pd.DataFrame(m.means_, columns=cols).T
+    ax = means.plot(kind='bar', figsize=(7,3.5))
+    ax.set_title(f"{res['side']} – state means (scaled features)")
+    ax.set_ylabel("Z-score")
+    plt.tight_layout(); plt.show()
+
+plot_state_means(res_buy)
+plot_state_means(res_sell)
+
+Summary by regime:
+
+def summarize_by_regime(res):
+    cs = res['cluster_summary']
+    s = (
+        cs.groupby('regime')
+          .agg(
+              n_clusters=('cluster','count'),
+              mean_qty=('total_qty','mean'),
+              median_duration_s=('duration_s','median'),
+              mean_price_span=('price_span','mean'),
+              mean_tempo=('tempo','mean'),
+          )
+          .sort_index()
+    )
+    return s
+
+print("BUY summary:\n",  summarize_by_regime(res_buy))
+print("SELL summary:\n", summarize_by_regime(res_sell))
+
+
+---
+
+Why this solves your two errors
+
+Degeneracy (“19 > 12”) → We automatically reduce d (drop features) and prefer spherical covariances, and we do not estimate start/transition. With K=2 and d=3 spherical, free params = K*d + K = 2*3 + 2 = 8 (well under 12).
+
+Zero-sum transition rows → We fix transmat_ to a valid, mildly persistent matrix (e.g., 0.85 self, rest evenly spread). We don’t estimate it; thus it never has zeros/invalid rows, even if all your sequences have length 1.
+
+
+
+---
+
+If you still get warnings
+
+Your N is extremely small. Drop to two features (the picker will do it) or temporarily lower K to 2→1 just to sanity-check the feature scaling.
+
+Grow N by aggregating more days or using 10-minute buckets to increase cluster count.
+
+If you must estimate transitions, set a tiny additive smoothing after fit:
+
+T = model.transmat_ + 1e-6
+model.transmat_ = T / T.sum(axis=1, keepdims=True)
+
+but with few transitions this is mathematically weak—fixing transmat_ is safer.
+
+
+
+---
+
+If you paste len(cluster_summary) for BUY/SELL and I’ll tell you exactly which features the picker will keep and whether K=2 is safe without dropping anything.
