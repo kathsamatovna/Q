@@ -1,0 +1,311 @@
+Good — I’ll be concise and code-focused, with exactly the fixes you need plus short explanations you can paste into your notebook. I’ve grouped fixes into: (A) why you hit “19 free scalars vs 12 points”, (B) defensive helpers to choose features/covariance so free_params ≤ N, (C) robust fitting (init, restarts, regularise transmat_), (D) checks for lengths/transmat zeros, (E) interpretation notes for the plots (very short). Paste these cells into your notebook (in order) and run them.
+
+
+---
+
+A — Free parameters: explanation + function
+
+Short explanation: free scalars = parameters the HMM must estimate. If free_params > N_observations you will get degenerate fits. For Gaussian HMM:
+
+means = K * d
+
+variances = K if spherical else K * d
+
+trans params = K*(K-1) if learn_trans else 0
+
+start params = K-1 if learn_start else 0
+
+
+def free_params(K, d, cov='spherical', learn_trans=False, learn_start=False):
+    """Count free scalars for Gaussian HMM with K states and d features."""
+    means = K * d
+    vars_ = K if cov == 'spherical' else K * d
+    trans = K * (K - 1) if learn_trans else 0
+    start = (K - 1) if learn_start else 0
+    return int(means + vars_ + trans + start)
+
+# quick check
+print("free params (K=2,d=4,spherical,not learning trans/start):",
+      free_params(2, 4, cov='spherical', learn_trans=False, learn_start=False))
+
+
+---
+
+B — Pick columns / covariance to satisfy parameter budget
+
+Automatically drop least-important features until free_params <= N_obs. Use this before creating X for HMM.
+
+def pick_cov_and_cols(N_obs, cols_avail, K=2, prefer_cov='spherical', learn_trans=False, learn_start=False):
+    """
+    Choose covariance type and subset of cols so free_params <= N_obs.
+    Drops columns in drop_order (least important last kept).
+    Returns (cov_choice, kept_cols)
+    """
+    drop_order = ['price_span', 'tempo', 'log_duration_s', 'log_total_qty']  # least -> most
+    cols = [c for c in cols_avail if c in cols_avail]  # copy order if needed
+    cov = prefer_cov
+    while True:
+        d = len(cols)
+        p = free_params(K, d, cov=cov, learn_trans=learn_trans, learn_start=learn_start)
+        if p <= N_obs or d == 1:
+            return cov, cols
+        # drop the least important available
+        for cand in drop_order:
+            if cand in cols and len(cols) > 1:
+                cols.remove(cand)
+                break
+        else:
+            # nothing left to drop -> if prefered cov is diag, try spherical; else break
+            if cov != 'spherical':
+                cov = 'spherical'
+                continue
+            return cov, cols
+
+
+---
+
+C — Robust fit: fixed trans/start, restarts, regularize
+
+Strategy:
+
+If data is small, do not learn startprob_ or transmat_ (set learn_trans=False, learn_start=False) and initialize them to mild persistence (diagonals high).
+
+Use covariance_type='spherical' where possible (fewer params).
+
+Run multiple random restarts and keep best score.
+
+
+from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+def init_start_trans(K, diag_p=0.85):
+    """Create mild-persistence startprob_ and transmat_ initial guesses."""
+    start = np.full(K, 1.0 / K)      # uniform start (you can change)
+    T = np.full((K, K), (1.0 - diag_p) / (K - 1))
+    np.fill_diagonal(T, diag_p)
+    return start, T
+
+def fit_hmm_restarts(X, lengths, K=2, cov='spherical', n_restarts=10, n_iter=200, random_state=0,
+                     learn_trans=False, learn_start=False, min_covar=1e-6):
+    """
+    Fit GaussianHMM robustly: multiple restarts, init start/trans, optional fixed start/trans.
+    Returns best_model, best_states, best_scaler.
+    """
+    best_score = -np.inf
+    best = None
+    rng = np.random.RandomState(random_state)
+
+    sc = StandardScaler().fit(X)        # scale features once (means/vars only learned)
+    Xs = sc.transform(X)
+
+    # init fixed start/trans and only learn means/vars
+    start_init, trans_init = init_start_trans(K, diag_p=0.85)
+
+    for seed in range(n_restarts):
+        model = GaussianHMM(n_components=K, covariance_type=cov, n_iter=n_iter, tol=1e-4,
+                            verbose=False, random_state=rng.randint(10**6))
+        # scale floor
+        model.min_covar = min_covar
+
+        # initialize params: only 'mc' (means + covars) if we do not learn trans/start
+        init_params = ''  # empty -> no random init required
+        params = 'mc' if (not learn_trans and not learn_start) else 'mc' + ('t' if learn_trans else '') + ('s' if learn_start else '')
+        # enforce which params to learn:
+        model.init_params = init_params
+        model.params = params
+
+        # set initial guesses
+        model.startprob_ = start_init.copy()
+        model.transmat_ = trans_init.copy()
+        # random small means around data
+        try:
+            model.means_ = np.vstack([Xs[np.random.randint(0, Xs.shape[0]), :] + 0.01 * rng.randn(Xs.shape[1]) for _ in range(K)])
+            if cov == 'spherical':
+                model.covars_ = np.full(K, np.var(Xs, axis=0).mean() + min_covar)
+            else:
+                model.covars_ = np.tile(np.var(Xs, axis=0) + min_covar, (K,1))
+        except Exception:
+            pass
+
+        # Fit
+        try:
+            model.fit(Xs, lengths=lengths)
+            score = model.score(Xs, lengths=lengths)
+        except Exception as e:
+            score = -np.inf
+
+        # regularize trans rows that are zero
+        if np.any(model.transmat_.sum(axis=1) == 0):
+            eps = 1e-8
+            model.transmat_ += eps
+            model.transmat_ /= model.transmat_.sum(axis=1, keepdims=True)
+
+        if score > best_score:
+            best_score = score
+            best = (model, model.predict(Xs, lengths=lengths), sc, score)
+
+    if best is None:
+        raise RuntimeError("HMM fitting failed on all restarts")
+    model, states, scaler, score = best
+    return model, states, scaler, score
+
+Notes: model.params string controls learning; setting model.init_params='' and model.params='mc' ensures we only learn means/covars and not start/trans; this reduces parameters and prevents zero rows.
+
+
+---
+
+D — Defensive checks you must run before/after fitting
+
+Paste these checks in your notebook before and after fit_hmm_restarts.
+
+def check_lengths(lengths):
+    if any(l <= 0 for l in lengths):
+        raise ValueError("Found zero-length sequence in 'lengths'. All lengths must be >= 1.")
+
+def check_transmat(model):
+    tm = model.transmat_
+    row_sums = tm.sum(axis=1)
+    zero_rows = np.where(row_sums <= 0)[0]
+    if zero_rows.size > 0:
+        print("WARNING: transmat has zero-sum rows:", zero_rows)
+        # regularize
+        eps = 1e-8
+        tm += eps
+        tm /= tm.sum(axis=1, keepdims=True)
+        model.transmat_ = tm
+        print("Regularized transmat; row sums now:", model.transmat_.sum(axis=1))
+
+Also ensure lengths list sums to N_obs and that you did not accidentally create sequences of length 1 only (Baum-Welch needs transitions).
+
+
+---
+
+E — If transmat_ rows are zero: why and remedy
+
+Why: your sequences are typically length 1 (per cluster summary) or there are no observed transitions between states inside any sequence. Baum-Welch then has no empirical transition counts to learn, so transmat_ can get degenerate zeros.
+
+Remedies (pick one or more):
+
+1. Do not learn transmat_ (learn_trans=False) and set model.transmat_ to mild persistence via init_start_trans(...).
+
+
+2. Create longer sequences (group clusters by day or by trader so lengths contain >1) — HMM needs within-sequence transitions.
+
+
+3. Regularize transmat_ after fit (code above).
+
+
+
+
+---
+
+F — Short helpers to prepare X, lengths from your cluster_summary
+
+Assuming cs is your cluster_summary DataFrame and you pass used_cols from pick_cov_and_cols.
+
+def make_X_and_lengths(cs, used_cols, sequence_mode='day'):
+    # cs must be sorted by sequence order
+    X_raw = cs[used_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
+    # lengths: if sequence_mode='day' we create one sequence per day (so sequences >1 if multiple clusters per day)
+    if sequence_mode == 'day':
+        days = cs['start_time'].dt.date
+        lengths = days.groupby(days).size().to_list()
+    elif sequence_mode == 'sizeRange' and 'sizeRange' in cs.columns:
+        lengths = cs.groupby('sizeRange').size().to_list()
+    else:
+        lengths = [len(cs)]
+    return X_raw, lengths
+
+Call flow (example):
+
+N_obs = len(cs)  # cluster_summary rows
+cov, used_cols = pick_cov_and_cols(N_obs, list(cs.columns), K=2, prefer_cov='spherical', learn_trans=False, learn_start=False)
+X_raw, lengths = make_X_and_lengths(cs, used_cols, sequence_mode='day')
+check_lengths(lengths)
+model, states, scaler, score = fit_hmm_restarts(X_raw, lengths, K=2, cov=cov, n_restarts=12, learn_trans=False, learn_start=False)
+check_transmat(model)
+
+
+---
+
+G — Restarts: why they help
+
+You saw fit success when K large: with large K there are more degrees of freedom and random init often finds non-degenerate configurations. Restarts pick the best log-likelihood across random starts. Use n_restarts=10..30 and keep best score.
+
+
+---
+
+H — Interpreting the plots you already create
+
+State means bar plot (you call plot_state_means) — those are in scaled z-scores (because we StandardScale). Positive means the regime has feature above dataset mean. To interpret in real units, inverse-transform with scaler.
+
+Timeline scatter — each dot is a cluster assigned to regime; x=time, y=total_qty — shows when each regime happens and its size.
+
+Boxplots (duration by regime) — shows distribution (median/iqr) of durations for clusters assigned to each state. If box is empty or tiny, you may have too few samples in that state.
+
+If a regime has 0 transitions and appears only once per sequence you will see isolated dots and no transition dynamics — that’s expected if your sequences are short.
+
+
+
+---
+
+I — Quick diagnostics to print after fitting
+
+Paste this to inspect the model summary quickly:
+
+def diag_print(model, used_cols):
+    K = model.n_components
+    print("K:", K, "cov:", model.covariance_type)
+    print("startprob_:", np.round(model.startprob_, 3))
+    print("transmat_:\n", np.round(model.transmat_, 3))
+    means = model.means_
+    print("means_ (scaled):\n", np.round(means, 3))
+    if model.covariance_type == 'spherical':
+        print("covars_ (spherical):", np.round(model.covars_, 6))
+    else:
+        print("covars_:\n", np.round(model.covars_, 6))
+    # sanity: row sums
+    print("trans row sums:", model.transmat_.sum(axis=1))
+
+
+---
+
+J — Final practical checklist (apply in order)
+
+1. Compute N_obs = len(cluster_summary).
+
+
+2. Use pick_cov_and_cols to get cov and used_cols.
+
+
+3. Build X_raw, lengths with make_X_and_lengths and run check_lengths.
+
+
+4. Fit fit_hmm_restarts(..., learn_trans=False, learn_start=False, cov='spherical').
+
+
+5. Run diag_print(model, used_cols) and check_transmat(model).
+
+
+6. If you want transitions learned, only enable learn_trans=True after you have sequences with real transitions (lengths >1 and multiple changes per sequence) and when free_params budget allows. Otherwise keep trans fixed.
+
+
+
+
+---
+
+K — If you want me to patch your notebook exactly
+
+Paste these values (just text) from one run and I will give the minimal edits to the functions in your notebook so they match the robust pipeline above:
+
+N_obs (an integer)
+
+len(cs) or cs.shape
+
+printout of diag_print from your current best model (startprob, transmat, means, covars) — or paste the model score and the free_params(K,d,...) you used.
+
+
+If you paste that, I’ll modify only the exact functions in your notebook (names you show: pick_cov_and_cols, fit_hmm_fixed_trans, hmm_pipeline_side) to be drop-in replacements and point out 3 lines to change.
+
+— End.
