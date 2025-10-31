@@ -1,0 +1,144 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.cm import tab20
+
+def plot_clusters(df_with_clusters,
+                  xcol='startTime',
+                  price_col='priceExecuted',    # left-y: price per trade
+                  size_col='grossExecuted',     # used only to scale cluster marker size if wanted
+                  cluster_col='cluster',
+                  slippage_col='slippage',
+                  time_formatter='%Y-%m-%d',
+                  figsize=(12,6)):
+    """
+    Minimal modification: keeps existing behaviour but
+    - plots per-trade scatter (x=startTime, y=price_col) colored by cluster
+    - plots mean slippage per cluster on twin y-axis with an interactive hover annotation
+    Returns: fig, ax, ax2, cluster_summary
+    """
+    df = df_with_clusters.copy()
+    df[xcol] = pd.to_datetime(df[xcol])
+    df = df.dropna(subset=[xcol, price_col, cluster_col, slippage_col])
+
+    df = df.sort_values(xcol)
+
+    # per-cluster summary: mean time, mean price, mean slippage, count, mean size
+    cluster_summary = (
+        df.groupby(cluster_col, observed=True)
+          .agg(start_time_mean=(xcol, 'mean'),
+               mean_price=(price_col, 'mean'),
+               mean_slippage=(slippage_col, 'mean'),
+               mean_size=(size_col, 'mean'),
+               count=(cluster_col, 'size'))
+          .reset_index()
+    )
+
+    if cluster_summary.shape[0] == 0:
+        raise ValueError("No clusters to plot after filtering NAs.")
+
+    # color mapping
+    unique_clusters = cluster_summary[cluster_col].unique()
+    cmap = tab20
+    color_list = [cmap(i % 20) for i in range(len(unique_clusters))]
+    color_map = {cid: color_list[i] for i, cid in enumerate(unique_clusters)}
+
+    # numeric x for consistent plotting
+    df['_xnum'] = mdates.date2num(df[xcol])
+    cluster_summary['_xnum'] = mdates.date2num(cluster_summary['start_time_mean'])
+
+    # figure and axes
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_title("Trades (price) by cluster and mean slippage per cluster (hover cluster markers)")
+    ax.set_xlabel("Start time")
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter(time_formatter))
+
+    # left axis scatter: per-trade price, colored by cluster
+    df['_color'] = df[cluster_col].map(color_map)
+    ax.scatter(df['_xnum'], df[price_col], c=df['_color'].tolist(),
+               s=18, alpha=0.6, edgecolors='none')
+
+    ax.set_ylabel(price_col)
+
+    # right axis: mean slippage per cluster
+    ax2 = ax.twinx()
+    # size cluster markers by count (or mean_size). scale to reasonable marker sizes:
+    sizes = (cluster_summary['count'] / cluster_summary['count'].max()) * 220 + 30
+    sc_cluster = ax2.scatter(cluster_summary['_xnum'], cluster_summary['mean_slippage'],
+                             s=sizes,
+                             c=[color_map[cid] for cid in cluster_summary[cluster_col]],
+                             edgecolor='k', linewidth=0.6, marker='D', zorder=5)
+    ax2.plot(cluster_summary['_xnum'], cluster_summary['mean_slippage'],
+             linestyle='--', color='gray', linewidth=0.8, zorder=4)
+    ax2.set_ylabel(f"mean {slippage_col}")
+
+    plt.setp(ax.get_xticklabels(), rotation=25, ha='right')
+    plt.tight_layout()
+
+    # --- hover annotation for cluster markers (on ax2) ---
+    annot = ax2.annotate(
+        "", xy=(0,0), xytext=(15,15),
+        textcoords="offset points",
+        bbox=dict(boxstyle="round", fc="w"),
+        arrowprops=dict(arrowstyle="->")
+    )
+    annot.set_visible(False)
+
+    # precompute pixel positions of cluster markers (for speed)
+    cluster_pts_pix = ax2.transData.transform(
+        np.vstack([cluster_summary['_xnum'].values, cluster_summary['mean_slippage'].values]).T
+    )
+
+    def update_annot(idx):
+        row = cluster_summary.iloc[idx]
+        x = row['_xnum']
+        y = row['mean_slippage']
+        tstr = pd.to_datetime(row['start_time_mean']).strftime("%Y-%m-%d %H:%M")
+        text = (f"cluster: {row[cluster_col]}\n"
+                f"time(mean): {tstr}\n"
+                f"mean_slip: {row['mean_slippage']:.6g}\n"
+                f"mean_price: {row['mean_price']:.6g}\n"
+                f"count: {int(row['count'])}")
+        annot.xy = (x, y)
+        annot.set_text(text)
+        # color match bbox to cluster color
+        annot.get_bbox_patch().set_facecolor(color_map[row[cluster_col]])
+        annot.get_bbox_patch().set_alpha(0.9)
+
+    def hover(event):
+        vis = annot.get_visible()
+        if event.inaxes not in (ax, ax2):
+            if vis:
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+            return
+
+        mx, my = event.x, event.y
+        dists = np.hypot(cluster_pts_pix[:,0] - mx, cluster_pts_pix[:,1] - my)
+        min_idx = np.argmin(dists)
+        min_dist = dists[min_idx]
+        thresh = 12  # pixels
+        if min_dist < thresh:
+            update_annot(min_idx)
+            annot.set_visible(True)
+            fig.canvas.draw_idle()
+        else:
+            if vis:
+                annot.set_visible(False)
+                fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("motion_notify_event", hover)
+
+    return fig, ax, ax2, cluster_summary
+
+Use exactly as:
+
+fig, ax, ax2, summary = plot_clusters(df_with_clusters,
+                                      xcol='startTime',
+                                      price_col='priceExecuted',
+                                      cluster_col='cluster',
+                                      slippage_col='slippage')
+
+If you want the hover to trigger only when the cursor is over cluster markers (not over trade points) this implementation already does that (it checks distance to cluster marker pixels).
