@@ -1,0 +1,129 @@
+Nice — two short, code-only recipes (with tiny comments) that do exactly what you asked.
+
+1. Sort bars by bucket size (either by a fixed size-order or by mean grossExecuted per bucket):
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def plot_slippages_by_bucket_sorted(df,
+                                    size_col='sizeRange',
+                                    qty_col='grossExecuted',
+                                    slippage_cols=('slippageMidToMid','midImpact','slippageMidToPx'),
+                                    fixed_order=None,
+                                    sort_by_mean_qty=False):
+    """
+    If fixed_order is provided (list of bucket labels) that order is used.
+    Otherwise if sort_by_mean_qty=True we sort buckets by mean qty ascending.
+    """
+    df = df.copy()
+
+    # 1) determine order of buckets
+    if fixed_order is not None:
+        order = list(fixed_order)
+    elif sort_by_mean_qty:
+        order = (df.groupby(size_col)[qty_col]
+                   .mean()
+                   .reset_index()
+                   .sort_values(qty_col)[size_col]
+                   .tolist())
+    else:
+        # natural sorted unique labels (alphabetical) — fallback
+        order = sorted(df[size_col].unique())
+
+    # ensure categorical with that order so plotting respects it
+    df[size_col] = pd.Categorical(df[size_col], categories=order, ordered=True)
+
+    # 2) aggregate mean slippages and mean qty per bucket
+    agg = (df.groupby(size_col)
+             .agg({qty_col: 'mean', **{c: 'mean' for c in slippage_cols}})
+             .reset_index())
+
+    # 3) plot: 3 barplots (left axis) + qty line on twin axis
+    fig, axes = plt.subplots(nrows=len(slippage_cols), ncols=1, figsize=(12, 3*len(slippage_cols)), constrained_layout=True)
+    if len(slippage_cols) == 1:
+        axes = [axes]
+
+    for ax, slip in zip(axes, slippage_cols):
+        sns.barplot(data=agg, x=size_col, y=slip, ax=ax, order=order)
+        ax.set_ylabel(slip)
+        ax.set_xlabel('')
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=30, ha='right')
+
+        ax2 = ax.twinx()
+        sns.lineplot(data=agg, x=size_col, y=qty_col, marker='o', ax=ax2, sort=False)
+        ax2.set_ylabel(f"mean {qty_col}")
+
+    plt.show()
+
+Use examples:
+
+# fixed bucket order you like
+fixed = ['<=1m','5m<=size<=10m','1m<=size<=5m','10m<=size<=20m']
+plot_slippages_by_bucket_sorted(df, fixed_order=fixed)
+
+# or auto-sort buckets by mean grossExecuted
+plot_slippages_by_bucket_sorted(df, sort_by_mean_qty=True)
+
+
+---
+
+2. Same stats but separate plots per cluster (one subplot per cluster) — two options:
+
+
+
+A — loop & draw a small figure per cluster (explicit control):
+
+def plot_per_cluster_loop(df, cluster_col='cluster', **plot_kwargs):
+    clusters = sorted(df[cluster_col].dropna().unique())
+    for cl in clusters:
+        sub = df[df[cluster_col] == cl]
+        if len(sub) < 2:
+            # skip tiny clusters
+            continue
+        plt.suptitle(f"Cluster {cl}")
+        plot_slippages_by_bucket_sorted(sub, **plot_kwargs)
+
+Call: plot_per_cluster_loop(df, cluster_col='cluster', fixed_order=fixed)
+
+B — seaborn FacetGrid / catplot (single figure with columns for clusters) — good when cluster count is small:
+
+def plot_per_cluster_catplot(df, size_col='sizeRange', cluster_col='cluster',
+                             qty_col='grossExecuted', slip_col='slippageMidToMid',
+                             order=None, col_wrap=3):
+    # prepare order if provided
+    if order is not None:
+        df[size_col] = pd.Categorical(df[size_col], categories=order, ordered=True)
+
+    # aggregate per cluster+bucket (mean)
+    agg = (df.groupby([cluster_col, size_col])
+             .agg({qty_col: 'mean', slip_col: 'mean'})
+             .reset_index())
+
+    # seaborn catplot: one subplot per cluster
+    g = sns.catplot(data=agg, x=size_col, y=slip_col, col=cluster_col,
+                    kind='bar', col_wrap=col_wrap, sharey=False, order=order,
+                    height=3.5, aspect=1.4)
+    for ax in g.axes.flatten():
+        ax.tick_params(axis='x', rotation=30)
+    plt.show()
+
+Call example:
+
+plot_per_cluster_catplot(df, slip_col='slippageMidToMid', order=fixed, col_wrap=4)
+
+
+---
+
+Notes / small gotchas
+
+If clusters have very few rows some bars/boxes will be meaningless — skip clusters with tiny N or annotate counts.
+
+Make sure sizeRange labels are consistent (no stray whitespace/capitalisation). Use df[size_col] = df[size_col].str.strip() before plotting.
+
+catplot is easiest for many pretty small panels; loop+function gives max control (titles, skipping, logging).
+
+
+If you want, I can give the exact one-liner to compute fixed in your dataset (e.g. sorted(df['sizeRange'].unique(), key=...)) — but this should get you everything needed.
